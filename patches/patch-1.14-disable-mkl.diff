@@ -1,0 +1,2983 @@
+diff --git a/.bazelrc b/.bazelrc
+index d4d7ad6186..b74b111d8c 100644
+--- a/.bazelrc
++++ b/.bazelrc
+@@ -28,14 +28,12 @@ build --define framework_shared_object=true
+ # If you would like to use a local MKL instead of downloading, please set the
+ # environment variable "TF_MKL_ROOT" every time before build.
+ build:mkl --define=build_with_mkl=true --define=enable_mkl=true
+-build:mkl --define=tensorflow_mkldnn_contraction_kernel=0
+ build:mkl -c opt
+ 
+ # This config option is used to enable MKL-DNN open source library only,
+ # without depending on MKL binary version.
+ build:mkl_open_source_only --define=build_with_mkl_dnn_only=true
+ build:mkl_open_source_only --define=build_with_mkl=true --define=enable_mkl=true
+-build:mkl_open_source_only --define=tensorflow_mkldnn_contraction_kernel=0
+ 
+ build:download_clang --crosstool_top=@local_config_download_clang//:toolchain
+ build:download_clang --define=using_clang=true
+diff --git a/tensorflow/core/BUILD b/tensorflow/core/BUILD
+index acda23822b..fd7f5c7128 100644
+--- a/tensorflow/core/BUILD
++++ b/tensorflow/core/BUILD
+@@ -1575,6 +1575,8 @@ cc_library(
+         "//tensorflow/core/kernels:mkl_slice_op",
+         "//tensorflow/core/kernels:mkl_softmax_op",
+         "//tensorflow/core/kernels:mkl_transpose_op",
++        "//tensorflow/core/kernels:mkl_batch_matmul_op",
++        "//tensorflow/core/kernels:mkl_matmul_op",
+         "//tensorflow/core/kernels:mkl_tfconv_op",
+         "//tensorflow/core/kernels:mkl_aggregate_ops",
+     ]) + if_cuda([
+@@ -4372,6 +4374,7 @@ tf_cc_test_mkl(
+         "//third_party/eigen3",
+     ] + if_mkl([
+         "//tensorflow/core/kernels:mkl_aggregate_ops",
++        "//tensorflow/core/kernels:mkl_batch_matmul_op",
+         "//tensorflow/core/kernels:mkl_concat_op",
+         "//tensorflow/core/kernels:mkl_conv_op",
+         "//tensorflow/core/kernels:mkl_cwise_ops_common",
+@@ -4380,6 +4383,7 @@ tf_cc_test_mkl(
+         "//tensorflow/core/kernels:mkl_identity_op",
+         "//tensorflow/core/kernels:mkl_input_conversion_op",
+         "//tensorflow/core/kernels:mkl_lrn_op",
++        "//tensorflow/core/kernels:mkl_matmul_op",
+         "//tensorflow/core/kernels:mkl_pooling_ops",
+         "//tensorflow/core/kernels:mkl_quantize_op",
+         "//tensorflow/core/kernels:mkl_relu_op",
+@@ -4387,6 +4391,7 @@ tf_cc_test_mkl(
+         "//tensorflow/core/kernels:mkl_slice_op",
+         "//tensorflow/core/kernels:mkl_softmax_op",
+         "//tensorflow/core/kernels:mkl_tfconv_op",
++        "//tensorflow/core/kernels:mkl_transpose_op",
+     ]),
+ )
+ 
+diff --git a/tensorflow/core/common_runtime/threadpool_device.cc b/tensorflow/core/common_runtime/threadpool_device.cc
+index c60d2a7d87..bbe57a1cd9 100644
+--- a/tensorflow/core/common_runtime/threadpool_device.cc
++++ b/tensorflow/core/common_runtime/threadpool_device.cc
+@@ -52,7 +52,12 @@ ThreadPoolDevice::ThreadPoolDevice(const SessionOptions& options,
+       scoped_allocator_mgr_(new ScopedAllocatorMgr(name)) {
+ #ifdef INTEL_MKL
+   // Early return when MKL is disabled
+-  if (DisableMKL()) return;
++    if (DisableMKL()) {
++    // Set number of OMP threads to 1 to get the default behavior
++    // of non-MKL build.
++    omp_set_num_threads(1);
++    return;
++  }
+ #ifdef _OPENMP
+   const char* user_omp_threads = getenv("OMP_NUM_THREADS");
+   if (user_omp_threads == nullptr) {
+diff --git a/tensorflow/core/framework/common_shape_fns.cc b/tensorflow/core/framework/common_shape_fns.cc
+index aafe2a6381..c201bf7b8b 100644
+--- a/tensorflow/core/framework/common_shape_fns.cc
++++ b/tensorflow/core/framework/common_shape_fns.cc
+@@ -270,6 +270,42 @@ Status BatchMatMulV2Shape(shape_inference::InferenceContext* c) {
+   return Status::OK();
+ }
+ 
++Status BatchMatMulShape(shape_inference::InferenceContext* c) {
++  ShapeHandle a_shape;
++  ShapeHandle b_shape;
++  TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(0), 2, &a_shape));
++  TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(1), 2, &b_shape));
++
++  // Determine output rows and cols.
++  bool adj_x;
++  bool adj_y;
++  TF_RETURN_IF_ERROR(c->GetAttr("adj_x", &adj_x));
++  TF_RETURN_IF_ERROR(c->GetAttr("adj_y", &adj_y));
++  DimensionHandle output_rows = c->Dim(a_shape, adj_x ? -1 : -2);
++  DimensionHandle output_cols = c->Dim(b_shape, adj_y ? -2 : -1);
++
++  // Batch dims match between inputs.
++  ShapeHandle a_batch_dims;
++  ShapeHandle b_batch_dims;
++  ShapeHandle batch_dims;
++  TF_RETURN_IF_ERROR(c->Subshape(a_shape, 0, -2, &a_batch_dims));
++  TF_RETURN_IF_ERROR(c->Subshape(b_shape, 0, -2, &b_batch_dims));
++  TF_RETURN_IF_ERROR(c->Merge(a_batch_dims, b_batch_dims, &batch_dims));
++
++  // Assert inner dims match.
++  DimensionHandle unused;
++  TF_RETURN_IF_ERROR(c->Merge(c->Dim(a_shape, adj_x ? -2 : -1),
++                              c->Dim(b_shape, adj_y ? -1 : -2), &unused));
++
++  ShapeHandle out;
++  TF_RETURN_IF_ERROR(
++      c->Concatenate(batch_dims, c->Matrix(output_rows, output_cols), &out));
++  c->set_output(0, out);
++  return Status::OK();
++}
++
++// --------------------------------------------------------------------------
++
+ Status BiasAddShape(shape_inference::InferenceContext* c) {
+   ShapeHandle input_shape;
+ 
+diff --git a/tensorflow/core/framework/common_shape_fns.h b/tensorflow/core/framework/common_shape_fns.h
+index 1712dc721e..5a11e7bf7b 100644
+--- a/tensorflow/core/framework/common_shape_fns.h
++++ b/tensorflow/core/framework/common_shape_fns.h
+@@ -230,6 +230,9 @@ Status MatMulShape(shape_inference::InferenceContext* c);
+ // batch dimensions.
+ Status BatchMatMulV2Shape(shape_inference::InferenceContext* c);
+ 
++// Shape function for BatchMatMul-like operations
++Status BatchMatMulShape(shape_inference::InferenceContext* c);
++
+ // Shape function for BiasAdd-like operations.
+ Status BiasAddShape(shape_inference::InferenceContext* c);
+ 
+diff --git a/tensorflow/core/graph/mkl_graph_util.h b/tensorflow/core/graph/mkl_graph_util.h
+index f36ca8c5a8..2ec644cb73 100644
+--- a/tensorflow/core/graph/mkl_graph_util.h
++++ b/tensorflow/core/graph/mkl_graph_util.h
+@@ -18,6 +18,8 @@ limitations under the License.
+ #ifdef INTEL_MKL
+ 
+ #include "tensorflow/core/framework/op_kernel.h"
++#include "tensorflow/core/framework/types.pb_text.h"
++#include "tensorflow/core/graph/graph.h"
+ 
+ namespace tensorflow {
+ // Since our ops are going to produce and also consume N addition tensors
+@@ -72,11 +74,35 @@ int inline GetTensorMetaDataIndex(int n, int total_tensors) {
+   return DataIndexToMetaDataIndex(tidx, total_tensors);
+ }
+ 
++// check if the control between src and dst nodes alreay exists
++bool inline DoesControlEdgeExist(const Node* src, const Node* dst) {
++  for (const Edge* edge : src->out_edges()) {
++    if (edge->IsControlEdge() && edge->dst() == dst) {
++      return true;
++    }
++  }
++  return false;
++}
++
++
+ namespace mkl_op_registry {
+-static const char* kMklOpLabel = "MklOp";
+-static const char* kMklOpLabelPattern = "label='MklOp'";
++// MKL operators whose kernels are registered with 'MklLayoutDependentOp' label
++// (e.g., MklConv2D) understand input tensors in MKL layout. These operators
++// get additional meta-tensors for actual input tensors.
++static const char* kMklLayoutDependentOpLabel = "MklLayoutDependentOp";
++static const char* kMklLayoutDependentOpLabelPattern =
++    "label='MklLayoutDependentOp'";
++// MKL operators whose kernels are registered with 'MklNameChangeOp' label
++// (e.g., MklMatMul, MklTranspose) do not understand input tensors in MKL
++// layout. These operators do not get additional meta-tensors. The signatures of
++// these operators are the same as the original TensorFlow operators that they
++// correspond to. So these ops just go through a name change during graph
++// rewrite pass.
++static const char* kMklNameChangeOpLabel = "MklNameChangeOp";
++static const char* kMklNameChangeOpLabelPattern = "label='MklNameChangeOp'";
+ static const char* kMklQuantizedOpLabel = "QuantizedMklOp";
+ static const char* kMklQuantizedOpLabelPattern = "label='QuantizedMklOp'";
++
+ // Prefix that we add to Tensorflow op name to construct Mkl op name.
+ static const char* const kMklOpPrefix = "_Mkl";
+ 
+@@ -85,13 +111,14 @@ static const char* const kMklOpPrefix = "_Mkl";
+ inline string GetMklOpName(const string& name) {
+   return string(kMklOpPrefix) + name;
+ }
+-
+-// Check whether opname with type T is registered as MKL-compliant.
++// Check whether opname with type T is registered as MKL operator
++// that can accept input tensors in MKL layout.
+ //
+ // @input: name of the op
+ // @input: T datatype to be used for checking op
+-// @return: true if opname is registered as Mkl op; false otherwise
+-static inline bool IsMklOp(const string& op_name, DataType T) {
++// @return: true if opname is registered as Mkl-layout dependent op;
++// false otherwise
++static inline bool IsMklLayoutDependentOp(const string& op_name, DataType T) {
+   string kernel = KernelsRegisteredForOp(op_name);
+ 
+   // Restrict quantized ops to QUINT8 and QINT8 for now
+@@ -99,7 +126,7 @@ static inline bool IsMklOp(const string& op_name, DataType T) {
+     return (T == DT_QUINT8 || T == DT_QINT8 || T == DT_QINT32);
+   }
+   // Restrict regular ops to FLOAT
+-  if (kernel.find(kMklOpLabelPattern) != string::npos) {
++  if (kernel.find(kMklLayoutDependentOpLabelPattern) != string::npos) {
+     return (T == DT_FLOAT);
+   }
+   return false;
+@@ -108,7 +135,7 @@ static inline bool IsMklOp(const string& op_name, DataType T) {
+ // TODO(mdfaijul): QuantizedConv2D is registered with input: QUINT8
+ // filter:QINT8 for mkldnn integration. First a dummy kernel is created
+ // and then it is replaced by an actual kernel.
+-static inline bool IsMklOp(const string& op_name, DataType Tinput,
++static inline bool IsMklLayoutDependentOp(const string& op_name, DataType Tinput,
+                            DataType Tfilter) {
+   string kernel = KernelsRegisteredForOp(op_name);
+ 
+@@ -119,6 +146,39 @@ static inline bool IsMklOp(const string& op_name, DataType Tinput,
+   return false;
+ }
+ 
++// Check whether opname with type T is registered as an MKL operator that
++// will go through name change.
++//
++// @input: name of the op
++// @input: T datatype to be used for checking op
++// @return: true if opname is registered as MKL op that will go through name
++// change; false otherwise
++static inline bool IsMklNameChangeOp(const string& op_name, DataType T) {
++  string kernel = KernelsRegisteredForOp(op_name);
++  // String returned by KernelsRegisteredForOp looks like below:
++  //
++  // Op = _MklMatMul, kernels =
++  // device='CPU'; label='MklNameChangeOp'; T in [DT_COMPLEX128]
++  // device='CPU'; label='MklNameChangeOp'; T in [DT_COMPLEX64]
++  // device='CPU'; label='MklNameChangeOp'; T in [DT_DOUBLE]
++  // device='CPU'; label='MklNameChangeOp'; T in [DT_FLOAT]
++
++  // Now we just construct a search string to match what we are looking for.
++  string search_string = kMklNameChangeOpLabelPattern;
++  search_string += string(";") + string(" T in [");
++  search_string += EnumName_DataType(T) + string("]");
++
++  return kernel.find(search_string) != string::npos;
++}
++
++// Check if the operator with 'op_name' and type 'T' is an MKL operator that
++// will either understand input tensors in MKL layout or will go through name
++// rewrite that some operators go through.
++static inline bool IsMklOp(const string& op_name, DataType T) {
++  return IsMklLayoutDependentOp(op_name, T) || IsMklNameChangeOp(op_name, T);
++}
++
++
+ // Check whether opname with type T is registered as MKL-compliant and
+ // is element-wise.
+ //
+diff --git a/tensorflow/core/graph/mkl_layout_pass.cc b/tensorflow/core/graph/mkl_layout_pass.cc
+index 6e7393e3c6..e57776511f 100644
+--- a/tensorflow/core/graph/mkl_layout_pass.cc
++++ b/tensorflow/core/graph/mkl_layout_pass.cc
+@@ -245,10 +245,12 @@ class MklLayoutRewritePass : public GraphOptimizationPass {
+     csinfo_.avg_pool_grad = "AvgPoolGrad";
+     csinfo_.avg_pool3d = "AvgPool3D";
+     csinfo_.avg_pool3d_grad = "AvgPool3DGrad";
++    csinfo_.batch_matmul = "BatchMatMul";
+     csinfo_.bias_add = "BiasAdd";
+     csinfo_.bias_add_grad = "BiasAddGrad";
+     csinfo_.concat = "Concat";
+     csinfo_.concatv2 = "ConcatV2";
++    csinfo_.conjugate_transpose = "ConjugateTranspose";
+     csinfo_.conv2d = "Conv2D";
+     csinfo_.conv2d_with_bias = "__MklDummyConv2DWithBias";
+     csinfo_.conv2d_grad_input = "Conv2DBackpropInput";
+@@ -347,236 +349,330 @@ class MklLayoutRewritePass : public GraphOptimizationPass {
+     // End - element-wise ops. See note above.
+ 
+     // NOTE: names are alphabetically sorted.
+-    rinfo_.push_back({csinfo_.addn, mkl_op_registry::GetMklOpName(csinfo_.addn),
+-                      CopyAttrsAddN, AlwaysRewrite});
+-    rinfo_.push_back({csinfo_.add, mkl_op_registry::GetMklOpName(csinfo_.add),
+-                      CopyAttrsDataType, AlwaysRewrite});
++    rinfo_.push_back({csinfo_.addn,
++                      mkl_op_registry::GetMklOpName(csinfo_.addn),
++                      CopyAttrsAddN, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
++    rinfo_.push_back({csinfo_.add,
++                      mkl_op_registry::GetMklOpName(csinfo_.add),
++                      CopyAttrsDataType, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.avg_pool,
+                       mkl_op_registry::GetMklOpName(csinfo_.avg_pool),
+-                      CopyAttrsPooling, AlwaysRewrite});
++                      CopyAttrsPooling, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.avg_pool_grad,
+                       mkl_op_registry::GetMklOpName(csinfo_.avg_pool_grad),
+-                      CopyAttrsPooling, AlwaysRewrite});
++                      CopyAttrsPooling, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.avg_pool3d,
+                       mkl_op_registry::GetMklOpName(csinfo_.avg_pool3d),
+-                      CopyAttrsPooling, AlwaysRewrite});
++                      CopyAttrsPooling, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.avg_pool3d_grad,
+                       mkl_op_registry::GetMklOpName(csinfo_.avg_pool3d_grad),
+-                      CopyAttrsPooling, AlwaysRewrite});
++                      CopyAttrsPooling, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
++    rinfo_.push_back({csinfo_.batch_matmul,
++                      mkl_op_registry::GetMklOpName(csinfo_.batch_matmul),
++                      CopyAttrsBatchMatMul,
++                      AlwaysRewrite,
++                      kRewriteForOpNameChange});
+     rinfo_.push_back({csinfo_.concat,
+                       mkl_op_registry::GetMklOpName(csinfo_.concat),
+-                      CopyAttrsConcat, AlwaysRewrite});
++                      CopyAttrsConcat, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.concatv2,
+                       mkl_op_registry::GetMklOpName(csinfo_.concatv2),
+-                      CopyAttrsConcatV2, AlwaysRewrite});
++                      CopyAttrsConcatV2, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
++    rinfo_.push_back({csinfo_.conjugate_transpose,
++                      mkl_op_registry::GetMklOpName(csinfo_.conjugate_transpose),
++                      CopyAttrsTranspose,
++                      AlwaysRewrite,
++                      kRewriteForOpNameChange});
+     rinfo_.push_back({csinfo_.conv2d,
+                       mkl_op_registry::GetMklOpName(csinfo_.conv2d),
+-                      CopyAttrsConvCheckConstFilter, AlwaysRewrite});
++                      CopyAttrsConvCheckConstFilter, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.conv2d_with_bias, csinfo_.mkl_conv2d_with_bias,
+-                      CopyAttrsConvCheckConstFilter, AlwaysRewrite});
++                      CopyAttrsConvCheckConstFilter, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.conv2d_grad_filter,
+                       mkl_op_registry::GetMklOpName(csinfo_.conv2d_grad_filter),
+-                      CopyAttrsConv, AlwaysRewrite});
++                      CopyAttrsConv, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.conv2d_grad_filter_with_bias,
+                       csinfo_.mkl_conv2d_grad_filter_with_bias, CopyAttrsConv,
+-                      AlwaysRewrite});
++                      AlwaysRewrite, kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.conv2d_grad_input,
+                       mkl_op_registry::GetMklOpName(csinfo_.conv2d_grad_input),
+-                      CopyAttrsConv, AlwaysRewrite});
++                      CopyAttrsConv, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.conv3d,
+                       mkl_op_registry::GetMklOpName(csinfo_.conv3d),
+-                      CopyAttrsConvCheckConstFilter, AlwaysRewrite});
++                      CopyAttrsConvCheckConstFilter, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.conv3d_grad_filter,
+                       mkl_op_registry::GetMklOpName(csinfo_.conv3d_grad_filter),
+-                      CopyAttrsConv, AlwaysRewrite});
++                      CopyAttrsConv, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.conv3d_grad_input,
+                       mkl_op_registry::GetMklOpName(csinfo_.conv3d_grad_input),
+-                      CopyAttrsConv, AlwaysRewrite});
++                      CopyAttrsConv, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.depthwise_conv2d,
+                       mkl_op_registry::GetMklOpName(csinfo_.depthwise_conv2d),
+-                      CopyAttrsConv2DDepthwiseCheckConstFilter, AlwaysRewrite});
++                      CopyAttrsConv2DDepthwiseCheckConstFilter, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back(
+         {csinfo_.depthwise_conv2d_grad_input,
+          mkl_op_registry::GetMklOpName(csinfo_.depthwise_conv2d_grad_input),
+-         CopyAttrsConv2DDepthwise, AlwaysRewrite});
++         CopyAttrsConv2DDepthwise, AlwaysRewrite,
++         kRewriteForLayoutPropagation});
+     rinfo_.push_back(
+         {csinfo_.depthwise_conv2d_grad_filter,
+          mkl_op_registry::GetMklOpName(csinfo_.depthwise_conv2d_grad_filter),
+-         CopyAttrsConv2DDepthwise, AlwaysRewrite});
++         CopyAttrsConv2DDepthwise, AlwaysRewrite,
++         kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.dequantize,
+                       mkl_op_registry::GetMklOpName(csinfo_.dequantize),
+-                      CopyAttrsDequantize, DequantizeRewrite});
++                      CopyAttrsDequantize, DequantizeRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.fused_batch_norm,
+                       mkl_op_registry::GetMklOpName(csinfo_.fused_batch_norm),
+-                      CopyAttrsFusedBatchNorm, AlwaysRewrite});
++                      CopyAttrsFusedBatchNorm, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back(
+         {csinfo_.fused_batch_norm_grad,
+          mkl_op_registry::GetMklOpName(csinfo_.fused_batch_norm_grad),
+-         CopyAttrsFusedBatchNorm, AlwaysRewrite});
++         CopyAttrsFusedBatchNorm, AlwaysRewrite,
++         kRewriteForLayoutPropagation});
+     rinfo_.push_back(
+         {csinfo_.fused_batch_norm_v2,
+          mkl_op_registry::GetMklOpName(csinfo_.fused_batch_norm_v2),
+-         CopyAttrsFusedBatchNormV2, AlwaysRewrite});
++         CopyAttrsFusedBatchNormV2, AlwaysRewrite,
++         kRewriteForLayoutPropagation});
+     rinfo_.push_back(
+         {csinfo_.fused_batch_norm_grad_v2,
+          mkl_op_registry::GetMklOpName(csinfo_.fused_batch_norm_grad_v2),
+-         CopyAttrsFusedBatchNormV2, AlwaysRewrite});
+-    rinfo_.push_back({csinfo_.fused_conv2d, csinfo_.mkl_fused_conv2d,
+-                      CopyAttrsFusedConv2D, FusedConv2DRewrite});
++         CopyAttrsFusedBatchNormV2, AlwaysRewrite,
++         kRewriteForLayoutPropagation});
++    rinfo_.push_back({csinfo_.fused_conv2d,
++                      csinfo_.mkl_fused_conv2d,
++                      CopyAttrsFusedConv2D, FusedConv2DRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.identity,
+                       mkl_op_registry::GetMklOpName(csinfo_.identity),
+-                      CopyAttrsDataType, AlwaysRewrite});
++                      CopyAttrsDataType, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.lrn, mkl_op_registry::GetMklOpName(csinfo_.lrn),
+-                      CopyAttrsLRN, LrnRewrite});
++                      CopyAttrsLRN, LrnRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.lrn_grad,
+                       mkl_op_registry::GetMklOpName(csinfo_.lrn_grad),
+-                      CopyAttrsLRN, LrnGradRewrite});
++                      CopyAttrsLRN, LrnGradRewrite,
++                      kRewriteForLayoutPropagation});
++    rinfo_.push_back({csinfo_.matmul,
++                      mkl_op_registry::GetMklOpName(csinfo_.matmul),
++                      CopyAttrsMatMul,
++                      AlwaysRewrite,
++                      kRewriteForOpNameChange});
+     rinfo_.push_back({csinfo_.leakyrelu,
+                       mkl_op_registry::GetMklOpName(csinfo_.leakyrelu),
+-                      CopyAttrsLeakyRelu, LeakyReluRewrite});
++                      CopyAttrsLeakyRelu, LeakyReluRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.leakyrelu_grad,
+                       mkl_op_registry::GetMklOpName(csinfo_.leakyrelu_grad),
+-                      CopyAttrsLeakyRelu, LeakyReluRewrite});
++                      CopyAttrsLeakyRelu, LeakyReluRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.max_pool,
+                       mkl_op_registry::GetMklOpName(csinfo_.max_pool),
+-                      CopyAttrsPooling, NonDepthBatchWisePoolRewrite});
++                      CopyAttrsPooling, NonDepthBatchWisePoolRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.max_pool_grad,
+                       mkl_op_registry::GetMklOpName(csinfo_.max_pool_grad),
+-                      CopyAttrsPooling, MaxpoolGradRewrite});
++                      CopyAttrsPooling, MaxpoolGradRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.max_pool3d,
+                       mkl_op_registry::GetMklOpName(csinfo_.max_pool3d),
+-                      CopyAttrsPooling, NonDepthBatchWisePoolRewrite});
++                      CopyAttrsPooling, NonDepthBatchWisePoolRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.max_pool3d_grad,
+                       mkl_op_registry::GetMklOpName(csinfo_.max_pool3d_grad),
+-                      CopyAttrsPooling, AlwaysRewrite});
++                      CopyAttrsPooling, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.maximum,
+                       mkl_op_registry::GetMklOpName(csinfo_.maximum),
+-                      CopyAttrsDataType, AlwaysRewrite});
++                      CopyAttrsDataType, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.mul, mkl_op_registry::GetMklOpName(csinfo_.mul),
+-                      CopyAttrsDataType, AlwaysRewrite});
++                      CopyAttrsDataType, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.pad_with_conv2d, csinfo_.mkl_pad_with_conv2d,
+-                      CopyAttrsPadWithConv2D, AlwaysRewrite});
++                      CopyAttrsPadWithConv2D, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.pad_with_fused_conv2d,
+                       csinfo_.mkl_pad_with_fused_conv2d,
+-                      CopyAttrsPadWithFusedConv2D, AlwaysRewrite});
++                      CopyAttrsPadWithFusedConv2D, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.quantized_avg_pool,
+                       mkl_op_registry::GetMklOpName(csinfo_.quantized_avg_pool),
+-                      CopyAttrsQuantizedPooling, AlwaysRewrite});
++                      CopyAttrsQuantizedPooling, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.quantized_concatv2,
+                       mkl_op_registry::GetMklOpName(csinfo_.quantized_concatv2),
+-                      CopyAttrsConcatV2, AlwaysRewrite});
++                      CopyAttrsConcatV2, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.quantized_conv2d,
+                       mkl_op_registry::GetMklOpName(csinfo_.quantized_conv2d),
+-                      CopyAttrsQuantizedConv2D, AlwaysRewrite});
++                      CopyAttrsQuantizedConv2D, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back(
+         {csinfo_.quantized_conv2d_per_channel,
+          mkl_op_registry::GetMklOpName(csinfo_.quantized_conv2d_per_channel),
+-         CopyAttrsQuantizedConv2D, AlwaysRewrite});
++         CopyAttrsQuantizedConv2D, AlwaysRewrite,
++         kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.quantized_conv2d_with_requantize,
+                       mkl_op_registry::GetMklOpName(
+                           csinfo_.quantized_conv2d_with_requantize),
+-                      CopyAttrsQuantizedConv2D, AlwaysRewrite});
++                      CopyAttrsQuantizedConv2D, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back(
+         {csinfo_.quantized_conv2d_with_bias,
+          mkl_op_registry::GetMklOpName(csinfo_.quantized_conv2d_with_bias),
+-         CopyAttrsQuantizedConv2D, AlwaysRewrite});
++         CopyAttrsQuantizedConv2D, AlwaysRewrite,
++         kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.quantized_conv2d_with_bias_and_requantize,
+                       mkl_op_registry::GetMklOpName(
+                           csinfo_.quantized_conv2d_with_bias_and_requantize),
+-                      CopyAttrsQuantizedConv2D, AlwaysRewrite});
++                      CopyAttrsQuantizedConv2D, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back(
+         {csinfo_.quantized_conv2d_and_relu,
+          mkl_op_registry::GetMklOpName(csinfo_.quantized_conv2d_and_relu),
+-         CopyAttrsQuantizedConv2D, AlwaysRewrite});
++         CopyAttrsQuantizedConv2D, AlwaysRewrite,
++         kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.quantized_conv2d_and_relu_and_requantize,
+                       mkl_op_registry::GetMklOpName(
+                           csinfo_.quantized_conv2d_and_relu_and_requantize),
+-                      CopyAttrsQuantizedConv2D, AlwaysRewrite});
++                      CopyAttrsQuantizedConv2D, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.quantized_conv2d_with_bias_and_relu,
+                       mkl_op_registry::GetMklOpName(
+                           csinfo_.quantized_conv2d_with_bias_and_relu),
+-                      CopyAttrsQuantizedConv2D, AlwaysRewrite});
++                      CopyAttrsQuantizedConv2D, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back(
+         {csinfo_.quantized_conv2d_with_bias_and_relu_and_requantize,
+          mkl_op_registry::GetMklOpName(
+              csinfo_.quantized_conv2d_with_bias_and_relu_and_requantize),
+-         CopyAttrsQuantizedConv2D, AlwaysRewrite});
++         CopyAttrsQuantizedConv2D, AlwaysRewrite,
++         kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.quantized_max_pool,
+                       mkl_op_registry::GetMklOpName(csinfo_.quantized_max_pool),
+-                      CopyAttrsQuantizedPooling, AlwaysRewrite});
++                      CopyAttrsQuantizedPooling, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.quantized_conv2d_with_bias_sum_and_relu,
+                       mkl_op_registry::GetMklOpName(
+                           csinfo_.quantized_conv2d_with_bias_sum_and_relu),
+-                      CopyAttrsQuantizedConv2D, AlwaysRewrite});
++                      CopyAttrsQuantizedConv2D, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back(
+         {csinfo_.quantized_conv2d_with_bias_sum_and_relu_and_requantize,
+          mkl_op_registry::GetMklOpName(
+              csinfo_.quantized_conv2d_with_bias_sum_and_relu_and_requantize),
+-         CopyAttrsQuantizedConv2D, AlwaysRewrite});
++         CopyAttrsQuantizedConv2D, AlwaysRewrite,
++         kRewriteForLayoutPropagation});
+     rinfo_.push_back(
+         {csinfo_.quant_conv2d_with_bias_signed_sum_and_relu_and_requantize,
+          mkl_op_registry::GetMklOpName(
+              csinfo_.quant_conv2d_with_bias_signed_sum_and_relu_and_requantize),
+-         CopyAttrsQuantizedConv2D, AlwaysRewrite});
++         CopyAttrsQuantizedConv2D, AlwaysRewrite,
++         kRewriteForLayoutPropagation});
+     rinfo_.push_back(
+         {csinfo_.quantized_depthwise_conv2d,
+          mkl_op_registry::GetMklOpName(csinfo_.quantized_depthwise_conv2d),
+-         CopyAttrsQuantizedConv2D, AlwaysRewrite});
++         CopyAttrsQuantizedConv2D, AlwaysRewrite,
++         kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.quantized_depthwise_conv2d_with_bias,
+                       mkl_op_registry::GetMklOpName(
+                           csinfo_.quantized_depthwise_conv2d_with_bias),
+-                      CopyAttrsQuantizedConv2D, AlwaysRewrite});
++                      CopyAttrsQuantizedConv2D, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back(
+         {csinfo_.quantized_depthwise_conv2d_with_bias_and_relu,
+          mkl_op_registry::GetMklOpName(
+              csinfo_.quantized_depthwise_conv2d_with_bias_and_relu),
+-         CopyAttrsQuantizedConv2D, AlwaysRewrite});
++         CopyAttrsQuantizedConv2D, AlwaysRewrite,
++         kRewriteForLayoutPropagation});
+     rinfo_.push_back(
+         {csinfo_.quantized_depthwise_conv2d_with_bias_and_relu_and_requantize,
+          mkl_op_registry::GetMklOpName(
+              csinfo_
+                  .quantized_depthwise_conv2d_with_bias_and_relu_and_requantize),
+-         CopyAttrsQuantizedConv2D, AlwaysRewrite});
++         CopyAttrsQuantizedConv2D, AlwaysRewrite,
++         kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.quantize_v2,
+                       mkl_op_registry::GetMklOpName(csinfo_.quantize_v2),
+-                      CopyAttrsQuantizeV2, QuantizeOpRewrite});
++                      CopyAttrsQuantizeV2, QuantizeOpRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.relu, mkl_op_registry::GetMklOpName(csinfo_.relu),
+-                      CopyAttrsDataType, AlwaysRewrite});
++                      CopyAttrsDataType, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.relu_grad,
+                       mkl_op_registry::GetMklOpName(csinfo_.relu_grad),
+-                      CopyAttrsDataType, AlwaysRewrite});
++                      CopyAttrsDataType, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.relu6,
+                       mkl_op_registry::GetMklOpName(csinfo_.relu6),
+-                      CopyAttrsDataType, AlwaysRewrite});
++                      CopyAttrsDataType, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.relu6_grad,
+                       mkl_op_registry::GetMklOpName(csinfo_.relu6_grad),
+-                      CopyAttrsDataType, AlwaysRewrite});
++                      CopyAttrsDataType, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.requantize,
+                       mkl_op_registry::GetMklOpName(csinfo_.requantize),
+-                      CopyAttrsRequantize, AlwaysRewrite});
++                      CopyAttrsRequantize, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
++    // Disable these two MKL operators for now due to some test failures caused
++    // by these two ops
+     /*
+     rinfo_.push_back({csinfo_.tanh,
+                       mkl_op_registry::GetMklOpName(csinfo_.tanh),
+-                      CopyAttrsDataType, AlwaysRewrite});
++                      CopyAttrsDataType, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.tanh_grad,
+                       mkl_op_registry::GetMklOpName(csinfo_.tanh_grad),
+-                      CopyAttrsDataType, AlwaysRewrite});
++                      CopyAttrsDataType, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     */
+     rinfo_.push_back({csinfo_.reshape,
+                       mkl_op_registry::GetMklOpName(csinfo_.reshape),
+-                      CopyAttrsReshape, AlwaysRewrite});
++                      CopyAttrsReshape, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.slice,
+                       mkl_op_registry::GetMklOpName(csinfo_.slice),
+-                      CopyAttrsSlice, AlwaysRewrite});
++                      CopyAttrsSlice, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.softmax,
+                       mkl_op_registry::GetMklOpName(csinfo_.softmax),
+-                      CopyAttrsDataType, AlwaysRewrite});
++                      CopyAttrsDataType, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+ 
+     rinfo_.push_back({csinfo_.squared_difference,
+                       mkl_op_registry::GetMklOpName(csinfo_.squared_difference),
+-                      CopyAttrsDataType, AlwaysRewrite});
++                      CopyAttrsDataType, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
+     rinfo_.push_back({csinfo_.sub, mkl_op_registry::GetMklOpName(csinfo_.sub),
+-                      CopyAttrsDataType, AlwaysRewrite});
++                      CopyAttrsDataType, AlwaysRewrite,
++                      kRewriteForLayoutPropagation});
++    rinfo_.push_back({csinfo_.transpose,
++                      mkl_op_registry::GetMklOpName(csinfo_.transpose),
++                      CopyAttrsTranspose,
++                      AlwaysRewrite,
++                      kRewriteForOpNameChange});
+ 
+     // Add info about which ops to add workspace edge to and the slots.
+     wsinfo_.push_back({csinfo_.lrn, csinfo_.lrn_grad, 0, 2, 1, 3});
+@@ -646,6 +742,15 @@ class MklLayoutRewritePass : public GraphOptimizationPass {
+   // @return true, if and only if graph is mutated; false otherwise.
+   bool RunPass(std::unique_ptr<Graph>* g);
+ 
++  /// Cause for rewrite
++  /// Currently, we only support 2 causes - either for Mkl layout propagation
++  /// which is the most common case, or for just a name change (used in case
++  /// of ops like MatMul, Transpose, which do not support Mkl layout)
++  enum RewriteCause {
++    kRewriteForLayoutPropagation,
++    kRewriteForOpNameChange
++  };
++
+   /// Structure to specify the name of an original node, its new name after
+   /// rewrite, the number of inputs to the original node, the function to
+   /// be used to copy attributes for the op, and the rule (if any) which
+@@ -657,6 +762,8 @@ class MklLayoutRewritePass : public GraphOptimizationPass {
+     std::function<void(const Node*, NodeBuilder*, bool)> copy_attrs;
+     // A rule under which to rewrite this node
+     std::function<bool(const Node*)> rewrite_rule;
++    // Why are we rewriting?
++    RewriteCause rewrite_cause;
+   } RewriteInfo;
+ 
+   /// Structure to specify a forward op, a backward op, and the slot numbers
+@@ -728,10 +835,12 @@ class MklLayoutRewritePass : public GraphOptimizationPass {
+     string avg_pool_grad;
+     string avg_pool3d;
+     string avg_pool3d_grad;
++    string batch_matmul;
+     string bias_add;
+     string bias_add_grad;
+     string concat;
+     string concatv2;
++    string conjugate_transpose;
+     string conv2d;
+     string conv2d_with_bias;
+     string conv2d_grad_input;
+@@ -835,7 +944,7 @@ class MklLayoutRewritePass : public GraphOptimizationPass {
+ 
+   // Get length of a list in 'n' if 'arg' is of list type. Refer to
+   // description of ArgIsList for definition of list type.
+-  inline int GetTensorListLength(const OpDef::ArgDef& arg, Node* n) {
++  inline int GetTensorListLength(const OpDef::ArgDef& arg, const Node* n) {
+     CHECK_EQ(ArgIsList(arg), true);
+     int N = 0;
+     const string attr_name = !arg.type_list_attr().empty()
+@@ -1223,7 +1332,7 @@ class MklLayoutRewritePass : public GraphOptimizationPass {
+ 
+     DataType T;
+     TF_CHECK_OK(GetNodeAttr(node->def(), "T", &T));
+-    return mkl_op_registry::IsMklOp(
++    return mkl_op_registry::IsMklLayoutDependentOp(
+         mkl_op_registry::GetMklOpName(node->type_string()), T);
+   }
+ 
+@@ -1401,7 +1510,7 @@ class MklLayoutRewritePass : public GraphOptimizationPass {
+     // it includes those we support.
+     DataType T;
+     if (!GetNodeAttr(n->def(), "T", &T).ok() ||
+-        !mkl_op_registry::IsMklOp(csinfo_.mkl_fused_conv2d, T)) {
++        !mkl_op_registry::IsMklLayoutDependentOp(csinfo_.mkl_fused_conv2d, T)) {
+       return false;
+     }
+ 
+@@ -1428,6 +1537,43 @@ class MklLayoutRewritePass : public GraphOptimizationPass {
+   //         Otherwise, it is not updated.
+   Status RewriteNode(std::unique_ptr<Graph>* g, Node* n, const RewriteInfo* ri);
+ 
++  // Rewrites input node to just change its operator name. The number of
++  // inputs to the node and the number of outputs remain the same. Attributes
++  // of the new node could be copied from attributes of the old node or
++  // modified. copy_attrs field of RewriteInfo controls this.
++  //
++  // Conceptually, it allows us to rewrite:
++  //
++  //        f[a=v1,b=v2](x,y) -> g[a'=v3,b'=v4](x,y)
++  //
++  // Attributes can be altered without any restrictions --- they could be
++  // copied, modified, or deleted completely.
++  //
++  // @input  g - input graph, orig_node - Node to be rewritten,
++  //         ri - matching rewriteinfo
++  // @output new_node - points to newly created node
++  // @return Status::OK(), if the input node is rewritten;
++  //         Returns appropriate Status error code otherwise.
++  //         Graph is only updated when the input node is rewritten.
++  Status RewriteNodeForJustOpNameChange(std::unique_ptr<Graph>* g,
++                                        const Node* orig_node, Node** new_node,
++                                        const RewriteInfo* ri);
++
++  // Rewrites input node to enable MKL layout propagation. Please also refer to
++  // documentation for the function RewriteNodeForJustOpNameChange() to
++  // understand what it means.
++  //
++  // @input  g - input graph, orig_node - Node to be rewritten,
++  //         ri - matching rewriteinfo
++  // @output new_node - points to newly created node
++  // @return Status::OK(), if the input node is rewritten;
++  //         Returns appropriate Status error code otherwise.
++  //         Graph is updated in case the input node is rewritten.
++  //         Otherwise, it is not updated.
++  Status RewriteNodeForLayoutPropagation(std::unique_ptr<Graph>* g,
++                                         const Node* orig_node, Node** new_node,
++                                         const RewriteInfo* ri);
++
+   // Get nodes that will feed a list of TF tensors to the new
+   // node that we are constructing.
+   //
+@@ -1463,7 +1609,7 @@ class MklLayoutRewritePass : public GraphOptimizationPass {
+   //
+   // @return None
+   void GetNodesProducingMklTensorList(
+-      std::unique_ptr<Graph>* g, Node* orig_node,
++      std::unique_ptr<Graph>* g, const Node* orig_node,
+       const gtl::InlinedVector<std::pair<Node*, int>, 4>& inputs,
+       int* input_idx, int list_length,
+       std::vector<NodeBuilder::NodeOut>* output_nodes);
+@@ -1482,8 +1628,9 @@ class MklLayoutRewritePass : public GraphOptimizationPass {
+   // @output mkl_node_output_slot - the slot number of mkl_node that
+   //                                will feed the tensor
+   // @return None
+-  void GetNodeProducingMklTensor(std::unique_ptr<Graph>* g, Node* orig_node,
+-                                 Node* n, int n_output_slot, Node** mkl_node,
++  void GetNodeProducingMklTensor(std::unique_ptr<Graph>* g,
++                                 const Node* orig_node, Node* n,
++                                 int n_output_slot, Node** mkl_node,
+                                  int* mkl_node_output_slot);
+ 
+   // Setup new inputs using old inputs 'inputs' for the rewritten node in 'nb'
+@@ -1500,7 +1647,7 @@ class MklLayoutRewritePass : public GraphOptimizationPass {
+   int SetUpContiguousInputs(
+       std::unique_ptr<Graph>* g,
+       const gtl::InlinedVector<std::pair<Node*, int>, 4>& old_node_inputs,
+-      NodeBuilder* nb, Node* old_node,
++      NodeBuilder* nb, const Node* old_node,
+       std::vector<NodeBuilder::NodeOut>* workspace_tensors,
+       bool are_workspace_tensors_available);
+ 
+@@ -1514,15 +1661,26 @@ class MklLayoutRewritePass : public GraphOptimizationPass {
+   // returns appropriate status code.
+   Status SetUpInputs(std::unique_ptr<Graph>* g,
+                      const gtl::InlinedVector<std::pair<Node*, int>, 4>& inputs,
+-                     NodeBuilder* nb, Node* orig_node);
++                     NodeBuilder* nb, const Node* orig_node);
++
++  // Create new inputs by copying old inputs 'inputs' for the rewritten node
++  // in 'nb' in graph 'g'. Original node is input in 'orig_node'. This is mostly
++  // used in the context of rewrite for just operator name change in which
++  // inputs of old operator and new operator are same.
++  //
++  // Returns Status::OK() if setting up inputs is successful, otherwise
++  // returns appropriate status code.
++  Status CopyInputs(const Node* orig_node,
++                    const gtl::InlinedVector<std::pair<Node*, int>, 4>& inputs,
++                    NodeBuilder* nb);
+ 
+   // Add workspace edge on the input or output side of Node 'orig_node' by using
+   // NodeBuilder 'nb' for the new node provided. If 'orig_node' does not dictate
+   // adding workspace edge then do not add it. Workspace Tensorflow and Mkl
+   // tensors, if they need to be added, will be set into these tensors.
+   // If we set workspace tensors, then are_ws_tensors_added should be true.
+-  void AddWorkSpaceEdgeIfNeeded(std::unique_ptr<Graph>* g, Node* orig_node,
+-                                NodeBuilder* nb,
++  void AddWorkSpaceEdgeIfNeeded(std::unique_ptr<Graph>* g,
++                                const Node* orig_node, NodeBuilder* nb,
+                                 std::vector<NodeBuilder::NodeOut>* ws_tensors,
+                                 bool* are_ws_tensors_added);
+ 
+@@ -1561,6 +1719,8 @@ class MklLayoutRewritePass : public GraphOptimizationPass {
+   // NOTE: names are alphabetically sorted.
+   static void CopyAttrsAddN(const Node* orig_node, NodeBuilder* nb,
+                             bool change_format = false);
++  static void CopyAttrsBatchMatMul(const Node* orig_node, NodeBuilder* nb,
++                                   bool change_format = false);
+   static void CopyAttrsBiasAddGrad(const Node* orig_node, NodeBuilder* nb,
+                                    bool change_format = false);
+   static void CopyAttrsConcat(const Node* orig_node, NodeBuilder* nb,
+@@ -1590,6 +1750,8 @@ class MklLayoutRewritePass : public GraphOptimizationPass {
+                                    bool change_format = false);
+   static void CopyAttrsLRN(const Node* orig_node, NodeBuilder* nb,
+                            bool change_format = false);
++  static void CopyAttrsMatMul(const Node* orig_node, NodeBuilder* nb,
++                              bool change_format = false);
+   static void CopyAttrsPadWithConv2D(const Node* orig_node, NodeBuilder* nb,
+                                      bool change_format = false);
+   static void CopyAttrsPadWithFusedConv2D(const Node* orig_node,
+@@ -1620,6 +1782,8 @@ class MklLayoutRewritePass : public GraphOptimizationPass {
+                              bool change_format = false);
+   static void CopyAttrsSplit(const Node* orig_node, NodeBuilder* nb,
+                              bool change_format = false);
++  static void CopyAttrsTranspose(const Node* orig_node, NodeBuilder* nb,
++                                 bool change_format = false);
+   static void CopyFormatAttrsConv(const Node* orig_node, NodeBuilder* nb,
+                                   const std::vector<int32>& strides,
+                                   const std::vector<int32>& dilations,
+@@ -1629,9 +1793,9 @@ class MklLayoutRewritePass : public GraphOptimizationPass {
+   // using node for original node 'orig_node' and return it in '*out'.
+   // TODO(nhasabni) We should move this to mkl_util.h
+   void GetDummyMklTensorNode(std::unique_ptr<Graph>* g, Node** out,
+-                             Node* orig_node);
++                             const Node* orig_node);
+   void GetDummyWorkspaceTensorNode(std::unique_ptr<Graph>* g, Node** out,
+-                                   Node* orig_node);
++                                   const Node* orig_node);
+ };
+ 
+ MklLayoutRewritePass::ConstStringsInfo MklLayoutRewritePass::csinfo_;
+@@ -1686,7 +1850,8 @@ void MklLayoutRewritePass::GetNodesProducingTFTensorList(
+ 
+ // TODO(nhasabni) We should move this to mkl_util.h.
+ void MklLayoutRewritePass::GetDummyMklTensorNode(std::unique_ptr<Graph>* g,
+-                                                 Node** out, Node* orig_node) {
++                                                 Node** out,
++                                                 const Node* orig_node) {
+   // We use a tensor of shape {8} and value 0,0,0,0,0,0,0,0 to represent
+   // dummy Mkl tensor. 8 = 2*size_t.
+   const DataType dt = DataTypeToEnum<uint8>::v();
+@@ -1719,16 +1884,15 @@ void MklLayoutRewritePass::GetDummyMklTensorNode(std::unique_ptr<Graph>* g,
+     Node* orig_input0 = nullptr;
+     TF_CHECK_OK(
+         orig_node->input_node(0, const_cast<const Node**>(&orig_input0)));
+-    // Allow duplicate while adding control edge as it would fail (return
+-    // NULL) if we try to add duplicate edge.
+-    CHECK_NOTNULL((*g)->AddControlEdge(orig_input0, *out, true));
++    auto edge = (*g)->AddControlEdge(orig_input0, *out, false);
++    DCHECK(edge != nullptr || DoesControlEdgeExist(orig_input0, *out));
+   }
+ 
+   (*out)->set_assigned_device_name(orig_node->assigned_device_name());
+ }
+ 
+ void MklLayoutRewritePass::GetNodesProducingMklTensorList(
+-    std::unique_ptr<Graph>* g, Node* orig_node,
++    std::unique_ptr<Graph>* g, const Node* orig_node,
+     const gtl::InlinedVector<std::pair<Node*, int>, 4>& inputs, int* input_idx,
+     int list_length, std::vector<NodeBuilder::NodeOut>* output_nodes) {
+   CHECK_LT(*input_idx, inputs.size());
+@@ -1759,8 +1923,8 @@ void MklLayoutRewritePass::GetNodesProducingMklTensorList(
+ // if it is Mkl layer, or (2) a dummy node producing dummy Mkl tensor
+ // if 'n' is not an Mkl layer.
+ void MklLayoutRewritePass::GetNodeProducingMklTensor(
+-    std::unique_ptr<Graph>* g, Node* orig_node, Node* n, int n_output_slot,
+-    Node** mkl_node, int* mkl_node_output_slot) {
++    std::unique_ptr<Graph>* g, const Node* orig_node, Node* n,
++    int n_output_slot, Node** mkl_node, int* mkl_node_output_slot) {
+   CHECK_NOTNULL(n);
+   CHECK_NOTNULL(mkl_node);
+   CHECK_NOTNULL(mkl_node_output_slot);
+@@ -1768,7 +1932,7 @@ void MklLayoutRewritePass::GetNodeProducingMklTensor(
+   // If this is an MKL op, then it will create extra output for MKL layout.
+   DataType T;
+   if (GetNodeAttr(n->def(), "T", &T).ok() &&
+-      mkl_op_registry::IsMklOp(n->type_string(), T)) {
++      mkl_op_registry::IsMklLayoutDependentOp(n->type_string(), T)) {
+     // If this is an MKL op, then it will generate an edge that will receive
+     // Mkl tensor from a node.
+     // output slot number for Mkl tensor would be N+slot number of TensorFlow
+@@ -1790,7 +1954,7 @@ void MklLayoutRewritePass::GetNodeProducingMklTensor(
+ int MklLayoutRewritePass::SetUpContiguousInputs(
+     std::unique_ptr<Graph>* g,
+     const gtl::InlinedVector<std::pair<Node*, int>, 4>& old_node_inputs,
+-    NodeBuilder* nb, Node* old_node,
++    NodeBuilder* nb, const Node* old_node,
+     std::vector<NodeBuilder::NodeOut>* workspace_tensors,
+     bool are_workspace_tensors_available) {
+   CHECK_NOTNULL(workspace_tensors);
+@@ -1823,7 +1987,7 @@ int MklLayoutRewritePass::SetUpContiguousInputs(
+            e->dst()->type_string() == csinfo_.mkl_conv2d_with_bias ||
+            e->dst()->type_string() == csinfo_.mkl_fused_conv2d) &&
+           e->dst_input() == kConv2DFilterInputSlotIdx
+-          /* filter is 2nd input of Conv2D and _MklConv2D. */) {
++             /* filter is 2nd input of Conv2D and _MklConv2D. */) {
+         if (conv2d_node != nullptr) {
+           VLOG(1) << "MklLayoutRewritePass: unusual case of same filter"
+                   << " feeding multiple Conv2D nodes: "
+@@ -1938,7 +2102,7 @@ int MklLayoutRewritePass::SetUpContiguousInputs(
+ Status MklLayoutRewritePass::SetUpInputs(
+     std::unique_ptr<Graph>* g,
+     const gtl::InlinedVector<std::pair<Node*, int>, 4>& old_node_inputs,
+-    NodeBuilder* nb, Node* old_node) {
++    NodeBuilder* nb, const Node* old_node) {
+   // Let's check if we need to add workspace tensors for this node.
+   // We add workspace edge only for MaxPool, LRN and BatchNorm.
+   std::vector<NodeBuilder::NodeOut> workspace_tensors;
+@@ -2006,20 +2170,53 @@ Status MklLayoutRewritePass::SetUpInputs(
+   return Status::OK();
+ }
+ 
++Status MklLayoutRewritePass::CopyInputs(
++    const Node* old_node,
++    const gtl::InlinedVector<std::pair<Node*, int>, 4>& old_node_inputs,
++    NodeBuilder* nb) {
++  // Number of input slots to old node
++  // Input slots are represented by .Input() calls in REGISTER_OP.
++  int old_node_input_slots = old_node->op_def().input_arg_size();
++  // Actual number of inputs can be greater than or equal to number
++  // of Input slots because inputs of type list could be unfolded.
++  auto old_node_input_size = old_node_inputs.size();
++  DCHECK_GE(old_node_input_size, old_node_input_slots);
++
++   // Let's copy all inputs of old node to new node.
++  int iidx = 0;
++  for (int on_slot_idx = 0; on_slot_idx < old_node_input_slots; on_slot_idx++) {
++    // An input slot could be a single tensor or a list. We need
++    // to handle this case accordingly.
++    DCHECK_LT(iidx, old_node_input_size);
++    const OpDef::ArgDef& arg = old_node->op_def().input_arg(on_slot_idx);
++    if (ArgIsList(arg)) {
++      std::vector<NodeBuilder::NodeOut> new_node_inputs;
++      int N = GetTensorListLength(arg, old_node);
++      GetNodesProducingTFTensorList(old_node_inputs, &iidx, N,
++                                    &new_node_inputs);
++      nb->Input(new_node_inputs);
++    } else {
++      nb->Input(old_node_inputs[iidx].first, old_node_inputs[iidx].second);
++      iidx++;
++    }
++  }
++  return Status::OK();
++}
++
+ //////////////////////////////////////////////////////////////////////////
+ //           Helper functions related to workspace pass
+ //////////////////////////////////////////////////////////////////////////
+ 
+ // TODO(nhasabni) We should move this to mkl_util.h.
+ void MklLayoutRewritePass::GetDummyWorkspaceTensorNode(
+-    std::unique_ptr<Graph>* g, Node** out, Node* orig_node) {
++    std::unique_ptr<Graph>* g, Node** out, const Node* orig_node) {
+   // We use uint8 tensor of shape 8 with content {0,0,0,0,0,0,0,0} to represent
+   // workspace tensor.
+   GetDummyMklTensorNode(g, out, orig_node);
+ }
+ 
+ void MklLayoutRewritePass::AddWorkSpaceEdgeIfNeeded(
+-    std::unique_ptr<Graph>* g, Node* orig_node, NodeBuilder* nb,
++    std::unique_ptr<Graph>* g, const Node* orig_node, NodeBuilder* nb,
+     std::vector<NodeBuilder::NodeOut>* ws_tensors, bool* are_ws_tensors_added) {
+   bool workspace_edge_added = false;  // Default initializer
+   CHECK_NOTNULL(are_ws_tensors_added);
+@@ -2029,7 +2226,7 @@ void MklLayoutRewritePass::AddWorkSpaceEdgeIfNeeded(
+   TF_CHECK_OK(GetNodeAttr(orig_node->def(), "T", &T));
+   for (auto ws : wsinfo_) {
+     if (orig_node->type_string() == ws.fwd_op &&
+-        mkl_op_registry::IsMklOp(
++        mkl_op_registry::IsMklLayoutDependentOp(
+             mkl_op_registry::GetMklOpName(orig_node->type_string()), T)) {
+       // If this op is a fwd op, then we need to check if there is an
+       // edge from this node's fwd_slot to bwdop's bwd_slot. If there is
+@@ -2056,7 +2253,7 @@ void MklLayoutRewritePass::AddWorkSpaceEdgeIfNeeded(
+         nb->Attr("workspace_enabled", false);
+       }
+     } else if (orig_node->type_string() == ws.bwd_op &&
+-               mkl_op_registry::IsMklOp(
++               mkl_op_registry::IsMklLayoutDependentOp(
+                    mkl_op_registry::GetMklOpName(orig_node->type_string()),
+                    T)) {
+       // If this op is a bwd op, then we need to add workspace edge and
+@@ -2751,6 +2948,54 @@ void MklLayoutRewritePass::CopyAttrsFusedConv2D(const Node* orig_node,
+   nb->Attr("epsilon", epsilon);
+ }
+ 
++void MklLayoutRewritePass::CopyAttrsMatMul(const Node* orig_node,
++                                           NodeBuilder* nb,
++                                           bool change_format) {
++  DataType T;
++  bool transpose_a, transpose_b;
++
++   // Get all attributes from old node.
++  TF_CHECK_OK(GetNodeAttr(orig_node->def(), "T", &T));
++  TF_CHECK_OK(GetNodeAttr(orig_node->def(), "transpose_a", &transpose_a));
++  TF_CHECK_OK(GetNodeAttr(orig_node->def(), "transpose_b", &transpose_b));
++
++   // Add attributes to new node.
++  nb->Attr("T", T);
++  nb->Attr("transpose_a", transpose_a);
++  nb->Attr("transpose_b", transpose_b);
++}
++
++ void MklLayoutRewritePass::CopyAttrsTranspose(const Node* orig_node,
++                                              NodeBuilder* nb,
++                                              bool change_format) {
++  DataType T, Tperm;
++
++   // Get all attributes from old node.
++  TF_CHECK_OK(GetNodeAttr(orig_node->def(), "T", &T));
++  TF_CHECK_OK(GetNodeAttr(orig_node->def(), "Tperm", &Tperm));
++
++   // Add attributes to new node.
++  nb->Attr("T", T);
++  nb->Attr("Tperm", Tperm);
++}
++
++ void MklLayoutRewritePass::CopyAttrsBatchMatMul(const Node* orig_node,
++                                                NodeBuilder* nb,
++                                                bool change_format) {
++  DataType T;
++  bool adj_x, adj_y;
++
++   // Get all attributes from old node.
++  TF_CHECK_OK(GetNodeAttr(orig_node->def(), "T", &T));
++  TF_CHECK_OK(GetNodeAttr(orig_node->def(), "adj_x", &adj_x));
++  TF_CHECK_OK(GetNodeAttr(orig_node->def(), "adj_y", &adj_y));
++
++   // Add attributes to new node.
++  nb->Attr("T", T);
++  nb->Attr("adj_x", adj_x);
++  nb->Attr("adj_y", adj_y);
++}
++
+ //////////////////////////////////////////////////////////////////////////
+ //           Helper functions related to node merge pass
+ //////////////////////////////////////////////////////////////////////////
+@@ -2890,40 +3135,50 @@ Status MklLayoutRewritePass::MergeConv2DWithBiasAdd(std::unique_ptr<Graph>* g,
+   Node* new_node;
+   TF_CHECK_OK(nb.Finalize(&**g, &new_node));
+   CHECK_NOTNULL(new_node);
++  // In the following code of this function, an unsorted set is used to make
++  // sure no duplicated edges be added into the new node. Therefore, we can
++  // pass allow_duplicates = true in AddControlEdge call to skip the O(#edges)
++  // check in the routine. 
+ 
+   // Incoming data edges from 'pred' node and 'succ' node to new 'new_node'
+   // node are already copied in BuildNode. We handle control edges now.
++  std::unordered_set<Node*> unique_node;
+   for (const Edge* e : pred->in_edges()) {
+     if (e->IsControlEdge()) {
+-      // Allow duplicate while adding control edge as it would fail (return
+-      // NULL) if we try to add duplicate edge.
+-      CHECK_NOTNULL((*g)->AddControlEdge(e->src(), new_node, true));
++      auto result = unique_node.insert(e->src());
++      if (result.second) {
++		    (*g)->AddControlEdge(e->src(), new_node, true);
++	  }	
+     }
+   }
++  unique_node.clear();
+   for (const Edge* e : succ->in_edges()) {
+     if (e->IsControlEdge()) {
+-      // Allow duplicate while adding control edge as it would fail (return
+-      // NULL) if we try to add duplicate edge.
+-      CHECK_NOTNULL((*g)->AddControlEdge(e->src(), new_node, true));
++      auto result = unique_node.insert(e->src());
++      if (result.second) {
++        (*g)->AddControlEdge(e->src(), new_node, true);
++      }
+     }
+   }
+-
++  unique_node.clear();
+   // Incoming edges are fixed, we will fix the outgoing edges now.
+   // First, we will fix outgoing control edges from 'pred' node.
+   for (const Edge* e : pred->out_edges()) {
+     if (e->IsControlEdge()) {
+-      // Allow duplicate while adding control edge as it would fail (return
+-      // NULL) if we try to add duplicate edge.
+-      CHECK_NOTNULL((*g)->AddControlEdge(new_node, e->dst(), true));
++       auto result = unique_node.insert(e->dst());
++       if (result.second) {
++        (*g)->AddControlEdge(new_node, e->dst(), true);
++      }
+     }
+   }
+-
++  unique_node.clear();
+   // Second, we will fix outgoing control and data edges from 'succ' node.
+   for (const Edge* e : succ->out_edges()) {
+     if (e->IsControlEdge()) {
+-      // Allow duplicate while adding control edge as it would fail (return
+-      // NULL) if we try to add duplicate edge.
+-      CHECK_NOTNULL((*g)->AddControlEdge(new_node, e->dst(), true));
++      auto result = unique_node.insert(e->dst());
++      if (result.second) {
++        (*g)->AddControlEdge(new_node, e->dst(), true);
++      }
+     } else {
+       // BiasAdd has only 1 output (at slot 0) and merged node also has only 1
+       // output (at slot 0).
+@@ -3176,25 +3431,33 @@ Status MklLayoutRewritePass::MergeConv2DBackpropFilterWithBiasAddGrad(
+   Node* new_node;
+   TF_CHECK_OK(nb.Finalize(&**g, &new_node));
+   CHECK_NOTNULL(new_node);
++  // In the following code of this function, an unsorted set is used to make
++  // sure no duplicated edges be added into the new node. Therefore, we can
++  // pass allow_duplicates = true in AddControlEdge call to skip the O(#edges)
++  // check in the routine.
+ 
+   // Incoming data edges from BiasAddGrad node and Conv2DBackpropFilter node to
+   // new 'new_node' node are already copied in BuildNode. We handle control
+   // edges now.
++  std::unordered_set<Node*> unique_node;
+   for (const Edge* e : badd->in_edges()) {
+     if (e->IsControlEdge()) {
+-      // Allow duplicate while adding control edge as it would fail (return
+-      // NULL) if we try to add duplicate edge.
+-      CHECK_NOTNULL((*g)->AddControlEdge(e->src(), new_node, true));
++      auto result = unique_node.insert(e->src());
++      if (result.second) {
++        (*g)->AddControlEdge(e->src(), new_node, true);
++      }
+     }
+   }
++  unique_node.clear();
+   for (const Edge* e : fltr->in_edges()) {
+     if (e->IsControlEdge()) {
+-      // Allow duplicate while adding control edge as it would fail (return
+-      // NULL) if we try to add duplicate edge.
+-      CHECK_NOTNULL((*g)->AddControlEdge(e->src(), new_node, true));
++      auto result = unique_node.insert(e->src());
++      if (result.second) {
++        (*g)->AddControlEdge(e->src(), new_node, true);
++      }
+     }
+   }
+-
++  unique_node.clear();
+   // Incoming edges are fixed, we will fix the outgoing edges now.
+   // First, we will fix outgoing control edges from 'badd' node.
+   // Conv2DBackpropFilter has 1 output -- filter_grad.
+@@ -3207,23 +3470,23 @@ Status MklLayoutRewritePass::MergeConv2DBackpropFilterWithBiasAddGrad(
+ 
+   for (const Edge* e : badd->out_edges()) {
+     if (e->IsControlEdge()) {
+-      // Allow duplicate while adding control edge as it would fail (return
+-      // NULL) if we try to add duplicate edge.
+-      CHECK_NOTNULL((*g)->AddControlEdge(new_node, e->dst(), true));
++      auto result = unique_node.insert(e->dst());
++      if (result.second) {
++        (*g)->AddControlEdge(new_node, e->dst(), true);
++      }
+     } else {
+       CHECK_NOTNULL((*g)->AddEdge(new_node, kMergedNodeBiasGradOutputIdx,
+                                   e->dst(), e->dst_input()));
+     }
+   }
+-
++  unique_node.clear(); 
+   // Second, we will fix outgoing control and data edges from 'fltr' node.
+   for (const Edge* e : fltr->out_edges()) {
+     if (e->IsControlEdge()) {
+-      // We allow duplicate edge for this case since we already add control
+-      // edge from new_node in line 3990. Line below could be adding same
+-      // edge to same destination again. In such case, if we do not allow
+-      // duplicate edge, then this call will fail.
+-      CHECK_NOTNULL((*g)->AddControlEdge(new_node, e->dst(), true));
++      auto result = unique_node.insert(e->dst());
++      if (result.second) {
++        (*g)->AddControlEdge(new_node, e->dst(), true);
++      }
+     } else {
+       CHECK_NOTNULL((*g)->AddEdge(new_node, kMergedNodeFilterGradOutputIdx,
+                                   e->dst(), e->dst_input()));
+@@ -3280,26 +3543,20 @@ Status MklLayoutRewritePass::MergeNode(std::unique_ptr<Graph>* g, Node* m,
+ //           Helper functions for node rewrite
+ //////////////////////////////////////////////////////////////////////////
+ 
+-Status MklLayoutRewritePass::RewriteNode(std::unique_ptr<Graph>* g,
+-                                         Node* orig_node,
+-                                         const RewriteInfo* ri) {
+-  CHECK_NOTNULL(ri);
+-  CHECK_NOTNULL(orig_node);
+-
+-  VLOG(1) << "MklLayoutRewritePass: Original node:" << orig_node->DebugString();
+-
+-  // Get all inputs.
+-  int num_inputs = orig_node->in_edges().size();
+-
++Status MklLayoutRewritePass::RewriteNodeForLayoutPropagation(
++    std::unique_ptr<Graph>* g, const Node* orig_node, Node** new_node,
++    const RewriteInfo* ri) {
++  // Get all data inputs.
++  int num_data_inputs = orig_node->in_edges().size();
+   // Drop count for control edges from inputs
+   for (const Edge* e : orig_node->in_edges()) {
+     if (e->IsControlEdge()) {
+-      num_inputs--;
++      num_data_inputs--;
+     }
+   }
+ 
+   gtl::InlinedVector<Node*, 4> control_edges;
+-  gtl::InlinedVector<std::pair<Node*, int>, 4> inputs(num_inputs);
++  gtl::InlinedVector<std::pair<Node*, int>, 4> inputs(num_data_inputs);
+   FillInputs(orig_node, &control_edges, &inputs);
+ 
+   // Build new node. We use same name as original node, but change the op name.
+@@ -3320,23 +3577,31 @@ Status MklLayoutRewritePass::RewriteNode(std::unique_ptr<Graph>* g,
+       DataTypeIsQuantized(orig_node->output_type(0))) {
+     nb.Attr("_kernel", mkl_op_registry::kMklQuantizedOpLabel);
+   } else {
+-    nb.Attr("_kernel", mkl_op_registry::kMklOpLabel);
++    nb.Attr("_kernel", mkl_op_registry::kMklLayoutDependentOpLabel);
+   }
+   // Finalize graph and get new node.
+-  Node* new_node = nullptr;
+-  TF_CHECK_OK(nb.Finalize(&**g, &new_node));
+-  CHECK_NOTNULL(new_node);
++  s = nb.Finalize(&**g, new_node);
++  if (s != Status::OK()) {
++    return s;
++  }
++  DCHECK(*new_node != nullptr);
++  // In the following code of this function, an unsorted set is used to make
++  // sure no duplicated edges be added into the new node. Therefore, we can
++  // pass allow_duplicates = true in AddControlEdge call to skip the O(#edges)
++  // check in the routine.
+ 
+   // Incoming data edges from 'orig_node' node to new 'new_node' node are
+   // already copied in BuildNode. We need to handle control edges now.
++  std::unordered_set<Node*> unique_node;
+   for (const Edge* e : orig_node->in_edges()) {
+     if (e->IsControlEdge()) {
+-      // Allow duplicate while adding control edge as it would fail (return
+-      // NULL) if we try to add duplicate edge.
+-      CHECK_NOTNULL((*g)->AddControlEdge(e->src(), new_node, true));
++      auto result = unique_node.insert(e->src());
++      if (result.second) {
++        (*g)->AddControlEdge(e->src(), *new_node, true);
++      }
+     }
+   }
+-
++  unique_node.clear();
+   // Copy outgoing edges from 'orig_node' node to new
+   // 'new_node' node, since the output also follows same ordering among
+   // Tensorflow tensors and Mkl tensors. We need to connect Tensorflow
+@@ -3346,17 +3611,110 @@ Status MklLayoutRewritePass::RewriteNode(std::unique_ptr<Graph>* g,
+   // GetTensorDataIndex provides this mapping function.
+   for (const Edge* e : orig_node->out_edges()) {
+     if (e->IsControlEdge()) {
+-      // Allow duplicate while adding control edge as it would fail (return
+-      // NULL) if we try to add duplicate edge.
+-      CHECK_NOTNULL((*g)->AddControlEdge(new_node, e->dst(), true));
++      auto result = unique_node.insert(e->dst());
++      if (result.second) {
++        (*g)->AddControlEdge(*new_node, e->dst(), true);
++      }
+     } else {
+       CHECK_NOTNULL((*g)->AddEdge(
+-          new_node,
++          *new_node,
+           GetTensorDataIndex(e->src_output(), e->src()->num_outputs()),
+           e->dst(), e->dst_input()));
+     }
+   }
++  return Status::OK();
++}
++
++Status MklLayoutRewritePass::RewriteNodeForJustOpNameChange(
++    std::unique_ptr<Graph>* g, const Node* orig_node, Node** new_node,
++    const RewriteInfo* ri) {
++  // Get all data inputs.
++  int num_data_inputs = orig_node->in_edges().size();
++  // Drop count for control edges from inputs
++  for (const Edge* e : orig_node->in_edges()) {
++    if (e->IsControlEdge()) {
++      num_data_inputs--;
++    }
++  }
++  gtl::InlinedVector<Node*, 4> control_edges;
++  gtl::InlinedVector<std::pair<Node*, int>, 4> inputs(num_data_inputs);
++  FillInputs(orig_node, &control_edges, &inputs);
++
++  // Build new node. We use same name as original node, but change the op name.
++  NodeBuilder nb(orig_node->name().c_str(), ri->new_name.c_str());
++  // Copy user-specified device assigned to original node to new node.
++  nb.Device(orig_node->def().device());
++
++  Status s = CopyInputs(orig_node, inputs, &nb);
++  if (s != Status::OK()) {
++    return s;
++  }
++
++  ri->copy_attrs(const_cast<const Node*>(orig_node), &nb, true);
++  nb.Attr("_kernel", mkl_op_registry::kMklNameChangeOpLabel);
++
++  // Finalize graph and get new node.
++  s = nb.Finalize(&**g, new_node);
++  if (s != Status::OK()) {
++    return s;
++  }
++  DCHECK(*new_node != nullptr);
++  // In the following code of this function, an unsorted set is used to make
++  // sure no duplicated edges be added into the new node. Therefore, we can
++  // pass allow_duplicates = true in AddControlEdge call to skip the O(#edges)
++  // check in the routine.
++
++  // Incoming data edges from 'orig_node' node to new 'new_node' node are
++  // already copied in BuildNode. We need to handle control edges now.
++  std::unordered_set<Node*> unique_node;
++  for (const Edge* e : orig_node->in_edges()) {
++    if (e->IsControlEdge()) {
++      auto result = unique_node.insert(e->src());
++      if (result.second) {
++        (*g)->AddControlEdge(e->src(), *new_node, true);
++      }
++    }
++  }
++  unique_node.clear();
++  // Transfer outgoing edges from 'orig_node' node to new 'new_node' node.
++  for (const Edge* e : orig_node->out_edges()) {
++    if (e->IsControlEdge()) {
++      auto result = unique_node.insert(e->dst());
++      if (result.second) {
++        (*g)->AddControlEdge(*new_node, e->dst(), true);
++      }
++    } else {
++      auto result =
++          (*g)->AddEdge(*new_node, e->src_output(), e->dst(), e->dst_input());
++      DCHECK(result != nullptr);
++    }
++  }
+ 
++  return Status::OK();
++}
++
++Status MklLayoutRewritePass::RewriteNode(std::unique_ptr<Graph>* g,
++                                         Node* orig_node,
++                                         const RewriteInfo* ri) {
++  DCHECK(ri != nullptr);
++  DCHECK(orig_node != nullptr);
++  
++  VLOG(1) << "MklLayoutRewritePass: Original node:" << orig_node->DebugString();
++
++  Status ret_status = Status::OK();
++  Node* new_node = nullptr;
++  if (ri->rewrite_cause == kRewriteForLayoutPropagation) {
++    ret_status = RewriteNodeForLayoutPropagation(g, orig_node, &new_node, ri);
++  } else if (ri->rewrite_cause == kRewriteForOpNameChange) {
++    ret_status = RewriteNodeForJustOpNameChange(g, orig_node, &new_node, ri);
++  } else {
++    ret_status = Status(error::Code::INVALID_ARGUMENT,
++                        "Unsupported rewrite cause found."
++                        "RewriteNode will fail.");
++  }
++  TF_CHECK_OK(ret_status);
++  DCHECK(new_node != nullptr);
++  
+   // Copy the runtime device assigned from original code to new node.
+   new_node->set_assigned_device_name(orig_node->assigned_device_name());
+ 
+@@ -3364,7 +3722,7 @@ Status MklLayoutRewritePass::RewriteNode(std::unique_ptr<Graph>* g,
+   (*g)->RemoveNode(orig_node);
+ 
+   VLOG(1) << "MklLayoutRewritePass: New node:" << new_node->DebugString();
+-  return Status::OK();
++  return ret_status;
+ }
+ 
+ // TODO(mdfaijul): Is there any other elegent way to check for quantized ops
+@@ -3377,7 +3735,8 @@ MklLayoutRewritePass::CheckForQuantizedNodeRewrite(const Node* n) const {
+         GetNodeAttr(n->def(), "Tfilter", &Tfilter).ok())) {
+     return nullptr;
+   }
+-  if (mkl_op_registry::IsMklOp(mkl_op_registry::GetMklOpName(n->type_string()),
++  if (mkl_op_registry::IsMklLayoutDependentOp(
++        mkl_op_registry::GetMklOpName(n->type_string()),
+                                Tinput, Tfilter)) {
+     for (auto ri = rinfo_.cbegin(); ri != rinfo_.cend(); ++ri) {
+       if (n->type_string().compare(ri->name) == 0 && ri->rewrite_rule(n)) {
+@@ -3424,8 +3783,8 @@ MklLayoutRewritePass::CheckForNodeRewrite(const Node* n) const {
+       n->type_string() != csinfo_.pad_with_fused_conv2d &&
+       n->type_string() != csinfo_.conv2d_grad_filter_with_bias &&
+       n->type_string() != csinfo_.fused_conv2d &&
+-      !mkl_op_registry::IsMklOp(mkl_op_registry::GetMklOpName(n->type_string()),
+-                                T)) {
++      !mkl_op_registry::IsMklOp(
++        mkl_op_registry::GetMklOpName(n->type_string()), T)) {
+     return nullptr;
+   }
+ 
+@@ -3448,7 +3807,7 @@ MklLayoutRewritePass::CheckForNodeRewrite(const Node* n) const {
+     bool incoming_mkl_edge = false;
+     int num_parent = 0;
+     for (auto parent : n->in_edges()) {
+-      if (mkl_op_registry::IsMklOp(parent->src()->type_string(), T)) {
++      if (mkl_op_registry::IsMklLayoutDependentOp(parent->src()->type_string(), T)) {
+         VLOG(1) << "ELEMENTWISE: parent " << num_parent++
+                 << " is MKL op: " << parent->src()->type_string();
+         incoming_mkl_edge = true;
+@@ -3657,7 +4016,7 @@ bool MklLayoutRewritePass::FixMklMetaDataEdges(std::unique_ptr<Graph>* g,
+   // If graph node is not Mkl node, then return.
+   DataType T = DT_INVALID;
+   if (!GetNodeAttr(n->def(), "T", &T).ok() ||
+-      !mkl_op_registry::IsMklOp(n->type_string(), T)) {
++      !mkl_op_registry::IsMklLayoutDependentOp(n->type_string(), T)) {
+     return result;
+   }
+ 
+@@ -3682,7 +4041,7 @@ bool MklLayoutRewritePass::FixMklMetaDataEdges(std::unique_ptr<Graph>* g,
+     // node, then we don't need to do anything.
+     Node* e_src = e->src();
+     if (GetNodeAttr(e_src->def(), "T", &T).ok() &&
+-        mkl_op_registry::IsMklOp(e_src->type_string(), T)) {
++        mkl_op_registry::IsMklLayoutDependentOp(e_src->type_string(), T)) {
+       // Source node for edge 'e' is Mkl node.
+       // Destination node and destination input slot of e is node 'n' and 'idx'
+       // resp.
+diff --git a/tensorflow/core/graph/mkl_tfconversion_pass.cc b/tensorflow/core/graph/mkl_tfconversion_pass.cc
+index 6646769945..95de6883da 100644
+--- a/tensorflow/core/graph/mkl_tfconversion_pass.cc
++++ b/tensorflow/core/graph/mkl_tfconversion_pass.cc
+@@ -93,7 +93,7 @@ class MklToTfConversionPass : public GraphOptimizationPass {
+   // @input T Datatype to use for checking input op
+   // @return true if op is Mkl supported; false, otherwise.
+   inline bool IsMklSupportedOp(const string& op_name, DataType T) const {
+-    return mkl_op_registry::IsMklOp(op_name, T);
++    return mkl_op_registry::IsMklLayoutDependentOp(op_name, T);
+   }
+ 
+   // Is the input Op supported by Mkl-specific layout AND
+@@ -189,7 +189,8 @@ Status MklToTfConversionPass::InsertConversionNodeOnEdge(
+   conversion_node->set_assigned_device_name(src->assigned_device_name());
+ 
+   // Set the Mkl op label for this op.
+-  conversion_node->AddAttr("_kernel", mkl_op_registry::kMklOpLabel);
++  conversion_node->AddAttr("_kernel",
++                           mkl_op_registry::kMklLayoutDependentOpLabel);
+ 
+   // Now that we have added edge from src->conversion_node, let's add edge from
+   // output of conversion_node to the dest node. Since conversion_node
+@@ -274,7 +275,8 @@ Status MklToTfConversionPass::InsertInputConversionNode(
+   conversion_node->set_assigned_device_name(n->assigned_device_name());
+ 
+   // Set the Mkl op label for this op.
+-  conversion_node->AddAttr("_kernel", mkl_op_registry::kMklOpLabel);
++  conversion_node->AddAttr("_kernel",
++                           mkl_op_registry::kMklLayoutDependentOpLabel);
+ 
+   // Now that we have added edges from src->conversion_node, let's add edge from
+   // output of conversion_node to the element-wise node.
+diff --git a/tensorflow/core/grappler/optimizers/remapper.cc b/tensorflow/core/grappler/optimizers/remapper.cc
+index 7072615cb5..41196a116a 100644
+--- a/tensorflow/core/grappler/optimizers/remapper.cc
++++ b/tensorflow/core/grappler/optimizers/remapper.cc
+@@ -27,6 +27,10 @@ limitations under the License.
+ #include "tensorflow/core/grappler/utils/topological_sort.h"
+ #include "tensorflow/core/platform/logging.h"
+ 
++#ifdef INTEL_MKL
++#include "tensorflow/core/util/util.h"
++#endif
++
+ namespace tensorflow {
+ namespace grappler {
+ 
+@@ -880,11 +884,9 @@ Status Remapper::Optimize(Cluster* /*cluster*/, const GrapplerItem& item,
+   FusedBatchNorm                        fused_batch_norm;
+   ContractionWithBiasAdd                contract_with_bias;
+   ContractionWithBiasAddAndActivation   contract_with_bias_and_activation;
+-#ifndef INTEL_MKL
+   ContractionWithBatchNorm              contract_with_batch_norm;
+   ContractionWithBatchNormAndActivation contract_with_batch_norm_and_activation;
+   ContractionWithSqueezeAndBiasAdd      contract_with_squeeze_and_bias;
+-#endif  // INTEL_MKL
+   // clang-format on
+ 
+   // Processing graph in reverse-topological sorted order allows to remap
+@@ -935,7 +937,11 @@ Status Remapper::Optimize(Cluster* /*cluster*/, const GrapplerItem& item,
+ 
+ // TODO(penporn):
+ // Remove this once TF-MKL supports _FusedConv2D with these operations.
+-#ifndef INTEL_MKL
++
++#ifdef INTEL_MKL
++if (DisableMKL())
++#endif  // INTEL_MKL
++{
+     // Remap Conv2D+Squeeze+BiasAdd into the _FusedConv2D+Squeeze.
+     if (allow_non_differentiable_rewrites &&
+         FindConv2DWithSqueezeAndBias(ctx, &node,
+@@ -961,7 +967,7 @@ Status Remapper::Optimize(Cluster* /*cluster*/, const GrapplerItem& item,
+                          optimized_graph, &invalidated_nodes);
+       continue;
+     }
+-#endif  // !INTEL_MKL
++}
+ 
+     // Infer properties lazily in case they are not needed.
+     if (!ctx.inferred_graph_properties && IsFusedBatchNormCandidate(node)) {
+diff --git a/tensorflow/core/kernels/BUILD b/tensorflow/core/kernels/BUILD
+index b195d06b33..5c172b9dce 100644
+--- a/tensorflow/core/kernels/BUILD
++++ b/tensorflow/core/kernels/BUILD
+@@ -766,6 +766,7 @@ cc_library(
+         "//tensorflow:ios": [],
+         "//tensorflow:linux_aarch64": [],
+         "//tensorflow:linux_ppc64le": [],
++		"//third_party/mkl:build_with_mkl": ["@mkl_dnn"],
+         "//conditions:default": ["@mkl_dnn//:mkldnn_single_threaded"],
+     }),
+ )
+@@ -1258,7 +1259,7 @@ tf_kernel_library(
+         "transpose_op.cc",
+     ],
+     hdrs = ["transpose_op.h"],
+-    deps = ARRAY_DEPS + if_mkl([":mkl_transpose_op"]),
++    deps = ARRAY_DEPS,
+ )
+ 
+ tf_kernel_library(
+@@ -3508,9 +3509,6 @@ tf_kernel_library(
+ 
+ tf_kernel_library(
+     name = "batch_matmul_op",
+-    srcs = if_mkl_ml([
+-        "mkl_batch_matmul_op.cc",
+-    ]),
+     # <prefix>*impl.h are excluded by default from the CPU build, add explicitly.
+     hdrs = ["batch_matmul_op_impl.h"],
+     prefix = "batch_matmul_op",
+@@ -3519,6 +3517,13 @@ tf_kernel_library(
+     ]),
+ )
+ 
++tf_mkl_kernel_library(
++    name = "mkl_batch_matmul_op",    
++    srcs = ["mkl_batch_matmul_op.cc"],
++	hdrs = ["batch_matmul_op_impl.h"],
++    deps = MATH_DEPS + mkl_deps(),
++)
++
+ tf_kernel_library(
+     name = "betainc_op",
+     prefix = "betainc_op",
+@@ -3582,9 +3587,7 @@ tf_kernel_library(
+     srcs = [
+         "matmul_op.cc",
+         "matmul_op_fused.cc",
+-    ] + if_mkl([
+-        "mkl_matmul_op.cc",
+-    ]),
++    ],
+     hdrs = ["matmul_op.h"],
+     defines = select({
+         ":xsmm": [
+@@ -3605,6 +3608,12 @@ tf_kernel_library(
+     ]),
+ )
+ 
++tf_mkl_kernel_library(
++    name = "mkl_matmul_op",
++    srcs = ["mkl_matmul_op.cc"],
++    deps = MATH_DEPS + mkl_deps(),
++)
++
+ tf_kernel_library(
+     name = "reduction_ops",
+     gpu_srcs = ["reduction_gpu_kernels.cu.h"],
+@@ -7534,7 +7543,7 @@ tf_mkl_kernel_library(
+         "mkl_transpose_op.cc",
+     ],
+     hdrs = ["transpose_op.h"],
+-    deps = ARRAY_DEPS + mkl_deps(),
++    deps = ARRAY_DEPS + mkl_deps() + [":transpose_op"],
+ )
+ 
+ # NOTE(lespeholt): This rule is deprecated, please use:
+diff --git a/tensorflow/core/kernels/batch_matmul_op_complex.cc b/tensorflow/core/kernels/batch_matmul_op_complex.cc
+index f48bd0c318..16913986d2 100644
+--- a/tensorflow/core/kernels/batch_matmul_op_complex.cc
++++ b/tensorflow/core/kernels/batch_matmul_op_complex.cc
+@@ -17,14 +17,8 @@ limitations under the License.
+ 
+ namespace tensorflow {
+ 
+-// MKL_ML registers its own complex64/128 kernels in mkl_batch_matmul_op.cc
+-// if defined(INTEL_MKL) && !defined(INTEL_MKL_DNN_ONLY) && defined(ENABLE_MKL).
+-// Anything else (the complement) should register the TF ones.
+-// (MKL-DNN doesn't implement these kernels either.)
+-#if !defined(INTEL_MKL) || defined(INTEL_MKL_DNN_ONLY) || !defined(ENABLE_MKL)
+ TF_CALL_complex64(REGISTER_BATCH_MATMUL_CPU);
+ TF_CALL_complex128(REGISTER_BATCH_MATMUL_CPU);
+-#endif  // !INTEL_MKL || INTEL_MKL_DNN_ONLY || !ENABLE_MKL
+ 
+ #if GOOGLE_CUDA
+ TF_CALL_complex64(REGISTER_BATCH_MATMUL_GPU);
+diff --git a/tensorflow/core/kernels/batch_matmul_op_real.cc b/tensorflow/core/kernels/batch_matmul_op_real.cc
+index 2806e692d8..3870c227a2 100644
+--- a/tensorflow/core/kernels/batch_matmul_op_real.cc
++++ b/tensorflow/core/kernels/batch_matmul_op_real.cc
+@@ -21,15 +21,8 @@ limitations under the License.
+ 
+ namespace tensorflow {
+ 
+-// MKL_ML registers its own float and double kernels in mkl_batch_matmul_op.cc
+-// if defined(INTEL_MKL) && !defined(INTEL_MKL_DNN_ONLY) && defined(ENABLE_MKL).
+-// Anything else (the complement) should register the TF ones.
+-// (MKL-DNN doesn't implement these kernels either.)
+-#if !defined(INTEL_MKL) || defined(INTEL_MKL_DNN_ONLY) || !defined(ENABLE_MKL)
+ TF_CALL_float(REGISTER_BATCH_MATMUL_CPU);
+ TF_CALL_double(REGISTER_BATCH_MATMUL_CPU);
+-#endif  // !INTEL_MKL || INTEL_MKL_DNN_ONLY || !ENABLE_MKL
+-
+ TF_CALL_half(REGISTER_BATCH_MATMUL_CPU);
+ TF_CALL_int32(REGISTER_BATCH_MATMUL_CPU);
+ TF_CALL_int64(REGISTER_BATCH_MATMUL_CPU);
+diff --git a/tensorflow/core/kernels/matmul_op.cc b/tensorflow/core/kernels/matmul_op.cc
+index 107f5a1195..f77c182d78 100644
+--- a/tensorflow/core/kernels/matmul_op.cc
++++ b/tensorflow/core/kernels/matmul_op.cc
+@@ -580,40 +580,6 @@ struct MatMulFunctor<SYCLDevice, T> {
+                               .Label("cublas"),                    \
+                           MatMulOp<GPUDevice, T, true /* cublas */>)
+ 
+-#if defined(INTEL_MKL) && defined(ENABLE_MKL)
+-
+-// MKL supports float, double, complex64 and complex128 types for
+-// matrix-multiplication, and these kernels are registered in mkl_matmul_op.cc.
+-// MKL does not support half, bfloat16, int32 and int64 types for
+-// matrix-multiplication, so register the kernel to use default Eigen based
+-// implementations for these types. REGISTER_CPU defines two versions - Eigen
+-// label and NO-LABEL
+-TF_CALL_half(REGISTER_CPU);
+-TF_CALL_bfloat16(REGISTER_CPU);
+-TF_CALL_int32(REGISTER_CPU);
+-TF_CALL_int64(REGISTER_CPU);
+-
+-// Float is supported in both MKL DNN as well as in MKL ML
+-// Registration for NO-LABEL version is in mkl_matmul_op.cc for types supported
+-// by MKL. However we define Eigen label version here just to pass a few unit
+-// tests
+-TF_CALL_float(REGISTER_CPU_EIGEN);
+-
+-// MKL DNN does not support complex64/complex128/double, if user specifies
+-// to use only opensource MKL DNN then use default implementation for these
+-// types otherwise use GEMM from MKL ML binary
+-
+-#if defined(INTEL_MKL_DNN_ONLY)
+-TF_CALL_complex64(REGISTER_CPU);
+-TF_CALL_complex128(REGISTER_CPU);
+-TF_CALL_double(REGISTER_CPU);
+-#else  // INTEL_MKL_DNN_ONLY
+-TF_CALL_complex64(REGISTER_CPU_EIGEN);
+-TF_CALL_complex128(REGISTER_CPU_EIGEN);
+-TF_CALL_double(REGISTER_CPU_EIGEN);
+-#endif  // INTEL_MKL_DNN_ONLY
+-
+-#else   // INTEL_MKL && ENABLE_MKL
+ TF_CALL_float(REGISTER_CPU);
+ TF_CALL_double(REGISTER_CPU);
+ TF_CALL_half(REGISTER_CPU);
+@@ -622,7 +588,6 @@ TF_CALL_int32(REGISTER_CPU);
+ TF_CALL_int64(REGISTER_CPU);
+ TF_CALL_complex64(REGISTER_CPU);
+ TF_CALL_complex128(REGISTER_CPU);
+-#endif  // INTEL_MKL && ENABLE_MKL
+ 
+ #if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+ TF_CALL_float(REGISTER_GPU);
+diff --git a/tensorflow/core/kernels/mkl_aggregate_ops.cc b/tensorflow/core/kernels/mkl_aggregate_ops.cc
+index 566ab79fb0..2c4f05013b 100644
+--- a/tensorflow/core/kernels/mkl_aggregate_ops.cc
++++ b/tensorflow/core/kernels/mkl_aggregate_ops.cc
+@@ -241,12 +241,11 @@ class MklAddNOp : public OpKernel {
+   }
+ };
+ 
+-#define REGISTER_MKL_CPU(T)                                         \
+-  REGISTER_KERNEL_BUILDER(Name("_MklAddN")                          \
+-                              .Device(DEVICE_CPU)                   \
+-                              .TypeConstraint<T>("T")               \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklAddNOp<CPUDevice, T>);
++#define REGISTER_MKL_CPU(T)                                             \
++  REGISTER_KERNEL_BUILDER(                                              \
++      Name("_MklAddN").Device(DEVICE_CPU).TypeConstraint<T>("T").Label( \
++          mkl_op_registry::kMklLayoutDependentOpLabel),                 \
++      MklAddNOp<CPUDevice, T>);
+ 
+ TF_CALL_float(REGISTER_MKL_CPU);
+ TF_CALL_bfloat16(REGISTER_MKL_CPU);
+diff --git a/tensorflow/core/kernels/mkl_avgpooling_op.cc b/tensorflow/core/kernels/mkl_avgpooling_op.cc
+index f13cfc1782..e74e256435 100644
+--- a/tensorflow/core/kernels/mkl_avgpooling_op.cc
++++ b/tensorflow/core/kernels/mkl_avgpooling_op.cc
+@@ -308,31 +308,31 @@ class MklAvgPoolingGradOp : public MklPoolingBackwardOpBase<T> {
+   }
+ };  // MklAvgPoolingGradOp
+ 
+-#define REGISTER_MKL_AVGPOOL3D_KERNELS(T)                           \
+-  REGISTER_KERNEL_BUILDER(Name("_MklAvgPool3D")                     \
+-                              .Device(DEVICE_CPU)                   \
+-                              .TypeConstraint<T>("T")               \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklAvgPoolingOp<CPUDevice, T>);           \
+-  REGISTER_KERNEL_BUILDER(Name("_MklAvgPool3DGrad")                 \
+-                              .Device(DEVICE_CPU)                   \
+-                              .TypeConstraint<T>("T")               \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
++#define REGISTER_MKL_AVGPOOL3D_KERNELS(T)                                      \
++  REGISTER_KERNEL_BUILDER(Name("_MklAvgPool3D")                                \
++                          .Device(DEVICE_CPU)                                  \
++                          .TypeConstraint<T>("T")                              \
++                          .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
++                          MklAvgPoolingOp<CPUDevice, T>);                      \
++  REGISTER_KERNEL_BUILDER(Name("_MklAvgPool3DGrad")                            \
++                          .Device(DEVICE_CPU)                                  \
++                          .TypeConstraint<T>("T")                              \
++                          .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
+                           MklAvgPoolingGradOp<CPUDevice, T>);
+ 
+ TF_CALL_float(REGISTER_MKL_AVGPOOL3D_KERNELS);
+ TF_CALL_bfloat16(REGISTER_MKL_AVGPOOL3D_KERNELS);
+ 
+-#define REGISTER_MKL_AVGPOOL_KERNELS(T)                             \
+-  REGISTER_KERNEL_BUILDER(Name("_MklAvgPool")                       \
+-                              .Device(DEVICE_CPU)                   \
+-                              .TypeConstraint<T>("T")               \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklAvgPoolingOp<CPUDevice, T>);           \
+-  REGISTER_KERNEL_BUILDER(Name("_MklAvgPoolGrad")                   \
+-                              .Device(DEVICE_CPU)                   \
+-                              .TypeConstraint<T>("T")               \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
++#define REGISTER_MKL_AVGPOOL_KERNELS(T)                                        \
++  REGISTER_KERNEL_BUILDER(Name("_MklAvgPool")                                  \
++                          .Device(DEVICE_CPU)                                  \
++                          .TypeConstraint<T>("T")                              \
++                          .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
++                          MklAvgPoolingOp<CPUDevice, T>);                      \
++  REGISTER_KERNEL_BUILDER(Name("_MklAvgPoolGrad")                              \
++                          .Device(DEVICE_CPU)                                  \
++                          .TypeConstraint<T>("T")                              \
++                          .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
+                           MklAvgPoolingGradOp<CPUDevice, T>);
+ 
+ TF_CALL_float(REGISTER_MKL_AVGPOOL_KERNELS);
+diff --git a/tensorflow/core/kernels/mkl_batch_matmul_op.cc b/tensorflow/core/kernels/mkl_batch_matmul_op.cc
+index 00ba430560..fc6a0c3591 100644
+--- a/tensorflow/core/kernels/mkl_batch_matmul_op.cc
++++ b/tensorflow/core/kernels/mkl_batch_matmul_op.cc
+@@ -40,6 +40,7 @@ limitations under the License.
+ #include "tensorflow/core/kernels/fill_functor.h"
+ #include "tensorflow/core/platform/logging.h"
+ #include "tensorflow/core/platform/types.h"
++#include "tensorflow/core/util/mkl_util.h"
+ 
+ namespace tensorflow {
+ 
+@@ -219,13 +220,13 @@ class BatchMatMulMkl : public OpKernel {
+   }
+ };
+ 
+-#define REGISTER_BATCH_MATMUL_MKL(TYPE)                                   \
+-  REGISTER_KERNEL_BUILDER(                                                \
+-      Name("BatchMatMul").Device(DEVICE_CPU).TypeConstraint<TYPE>("T"),   \
+-      BatchMatMulMkl<CPUDevice, TYPE>)                                    \
+-  REGISTER_KERNEL_BUILDER(                                                \
+-      Name("BatchMatMulV2").Device(DEVICE_CPU).TypeConstraint<TYPE>("T"), \
+-      BatchMatMulV2Op<CPUDevice, TYPE>)
++#define REGISTER_BATCH_MATMUL_MKL(TYPE)                   \
++  REGISTER_KERNEL_BUILDER(                                \
++      Name("_MklBatchMatMul")                             \
++          .Device(DEVICE_CPU)                             \
++          .TypeConstraint<TYPE>("T")                      \
++          .Label(mkl_op_registry::kMklNameChangeOpLabel), \
++      BatchMatMulMkl<CPUDevice, TYPE>)
+ 
+ #ifdef ENABLE_MKL
+ TF_CALL_float(REGISTER_BATCH_MATMUL_MKL);
+diff --git a/tensorflow/core/kernels/mkl_concat_op.cc b/tensorflow/core/kernels/mkl_concat_op.cc
+index adabbb534e..6c50ad0cce 100644
+--- a/tensorflow/core/kernels/mkl_concat_op.cc
++++ b/tensorflow/core/kernels/mkl_concat_op.cc
+@@ -656,20 +656,22 @@ class MklConcatOp : public OpKernel {
+ };
+ 
+ /* Use optimized concat for float type only */
+-#define REGISTER_MKL_CPU(type)                                              \
+-  REGISTER_KERNEL_BUILDER(Name("_MklConcat")                                \
+-                              .Device(DEVICE_CPU)                           \
+-                              .TypeConstraint<type>("T")                    \
+-                              .HostMemory("concat_dim")                     \
+-                              .Label(mkl_op_registry::kMklOpLabel),         \
+-                          MklConcatOp<CPUDevice, type, NAME_IS_CONCAT_DIM>) \
+-  REGISTER_KERNEL_BUILDER(Name("_MklConcatV2")                              \
+-                              .Device(DEVICE_CPU)                           \
+-                              .TypeConstraint<type>("T")                    \
+-                              .TypeConstraint<int32>("Tidx")                \
+-                              .HostMemory("axis")                           \
+-                              .Label(mkl_op_registry::kMklOpLabel),         \
+-                          MklConcatOp<CPUDevice, type, NAME_IS_AXIS>)
++#define REGISTER_MKL_CPU(type)                                 \
++  REGISTER_KERNEL_BUILDER(                                     \
++      Name("_MklConcat")                                       \
++          .Device(DEVICE_CPU)                                  \
++          .TypeConstraint<type>("T")                           \
++          .HostMemory("concat_dim")                            \
++          .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
++      MklConcatOp<CPUDevice, type, NAME_IS_CONCAT_DIM>)        \
++  REGISTER_KERNEL_BUILDER(                                     \
++      Name("_MklConcatV2")                                     \
++          .Device(DEVICE_CPU)                                  \
++          .TypeConstraint<type>("T")                           \
++          .TypeConstraint<int32>("Tidx")                       \
++          .HostMemory("axis")                                  \
++          .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
++      MklConcatOp<CPUDevice, type, NAME_IS_AXIS>)
+ 
+ TF_CALL_float(REGISTER_MKL_CPU);
+ TF_CALL_bfloat16(REGISTER_MKL_CPU);
+diff --git a/tensorflow/core/kernels/mkl_conv_grad_bias_ops.cc b/tensorflow/core/kernels/mkl_conv_grad_bias_ops.cc
+index 7c687f6581..7641cc8a74 100644
+--- a/tensorflow/core/kernels/mkl_conv_grad_bias_ops.cc
++++ b/tensorflow/core/kernels/mkl_conv_grad_bias_ops.cc
+@@ -255,12 +255,13 @@ class MklConv2DCustomBackpropBiasOp : public OpKernel {
+   TF_DISALLOW_COPY_AND_ASSIGN(MklConv2DCustomBackpropBiasOp);
+ };
+ 
+-#define REGISTER_CPU_KERNELS(T)                                     \
+-  REGISTER_KERNEL_BUILDER(Name("_MklConv2DWithBiasBackpropBias")    \
+-                              .Device(DEVICE_CPU)                   \
+-                              .TypeConstraint<T>("T")               \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklConv2DCustomBackpropBiasOp<CPUDevice, T>);
++#define REGISTER_CPU_KERNELS(T)                                \
++  REGISTER_KERNEL_BUILDER(                                     \
++      Name("_MklConv2DWithBiasBackpropBias")                   \
++          .Device(DEVICE_CPU)                                  \
++          .TypeConstraint<T>("T")                              \
++          .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
++      MklConv2DCustomBackpropBiasOp<CPUDevice, T>);
+ 
+ TF_CALL_float(REGISTER_CPU_KERNELS);
+ #undef REGISTER_CPU_KERNELS
+diff --git a/tensorflow/core/kernels/mkl_conv_grad_filter_ops.cc b/tensorflow/core/kernels/mkl_conv_grad_filter_ops.cc
+index 13d07f5dd2..8f48903d0d 100644
+--- a/tensorflow/core/kernels/mkl_conv_grad_filter_ops.cc
++++ b/tensorflow/core/kernels/mkl_conv_grad_filter_ops.cc
+@@ -704,30 +704,31 @@ class MklConvCustomBackpropFilterOp
+       Name("_MklConv2DBackpropFilter")                                   \
+           .Device(DEVICE_CPU)                                            \
+           .TypeConstraint<T>("T")                                        \
+-          .Label(mkl_op_registry::kMklOpLabel),                          \
++          .Label(mkl_op_registry::kMklLayoutDependentOpLabel),           \
+       MklConvCustomBackpropFilterOp<CPUDevice, T, false, false>);        \
+   REGISTER_KERNEL_BUILDER(                                               \
+       Name("_MklConv2DBackpropFilterWithBias")                           \
+           .Device(DEVICE_CPU)                                            \
+           .TypeConstraint<T>("T")                                        \
+-          .Label(mkl_op_registry::kMklOpLabel),                          \
++          .Label(mkl_op_registry::kMklLayoutDependentOpLabel),           \
+       MklConvCustomBackpropFilterOp<CPUDevice, T, true, false>);         \
+   REGISTER_KERNEL_BUILDER(                                               \
+       Name("_MklDepthwiseConv2dNativeBackpropFilter")                    \
+           .Device(DEVICE_CPU)                                            \
+           .TypeConstraint<T>("T")                                        \
+-          .Label(mkl_op_registry::kMklOpLabel),                          \
++          .Label(mkl_op_registry::kMklLayoutDependentOpLabel),           \
+       MklConvCustomBackpropFilterOp<CPUDevice, T, false, true>);         \
+-  REGISTER_KERNEL_BUILDER(Name("__MklDummyConv2DBackpropFilterWithBias") \
+-                              .Device(DEVICE_CPU)                        \
+-                              .TypeConstraint<T>("T")                    \
+-                              .Label(mkl_op_registry::kMklOpLabel),      \
+-                          MklDummyOp<CPUDevice, T>);                     \
++  REGISTER_KERNEL_BUILDER(                                               \
++      Name("__MklDummyConv2DBackpropFilterWithBias")                     \
++           .Device(DEVICE_CPU)                                           \
++           .TypeConstraint<T>("T")                                       \
++           .Label(mkl_op_registry::kMklLayoutDependentOpLabel),          \
++           MklDummyOp<CPUDevice, T>);                                    \
+   REGISTER_KERNEL_BUILDER(                                               \
+       Name("_MklConv3DBackpropFilterV2")                                 \
+           .Device(DEVICE_CPU)                                            \
+           .TypeConstraint<T>("T")                                        \
+-          .Label(mkl_op_registry::kMklOpLabel),                          \
++          .Label(mkl_op_registry::kMklLayoutDependentOpLabel),           \
+       MklConvCustomBackpropFilterOp<CPUDevice, T, false, false>);
+ 
+ TF_CALL_float(REGISTER_MKL_FILTER_KERNELS);
+diff --git a/tensorflow/core/kernels/mkl_conv_grad_input_ops.cc b/tensorflow/core/kernels/mkl_conv_grad_input_ops.cc
+index cd03b8ced0..19bc950410 100644
+--- a/tensorflow/core/kernels/mkl_conv_grad_input_ops.cc
++++ b/tensorflow/core/kernels/mkl_conv_grad_input_ops.cc
+@@ -558,21 +558,25 @@ class MklConvCustomBackpropInputOp
+ };
+ 
+ #define REGISTER_MKL_CPU_KERNELS(T)                                           \
+-  REGISTER_KERNEL_BUILDER(Name("_MklConv2DBackpropInput")                     \
+-                              .Device(DEVICE_CPU)                             \
+-                              .TypeConstraint<T>("T")                         \
+-                              .Label(mkl_op_registry::kMklOpLabel),           \
+-                          MklConvCustomBackpropInputOp<CPUDevice, T, false>); \
+-  REGISTER_KERNEL_BUILDER(Name("_MklConv3DBackpropInputV2")                   \
+-                              .Device(DEVICE_CPU)                             \
+-                              .TypeConstraint<T>("T")                         \
+-                              .Label(mkl_op_registry::kMklOpLabel),           \
+-                          MklConvCustomBackpropInputOp<CPUDevice, T, false>); \
+-  REGISTER_KERNEL_BUILDER(Name("_MklDepthwiseConv2dNativeBackpropInput")      \
+-                              .Device(DEVICE_CPU)                             \
+-                              .TypeConstraint<T>("T")                         \
+-                              .Label(mkl_op_registry::kMklOpLabel),           \
+-                          MklConvCustomBackpropInputOp<CPUDevice, T, true>);
++  REGISTER_KERNEL_BUILDER(                                                    \
++      Name("_MklConv2DBackpropInput")                                         \
++           .Device(DEVICE_CPU)                                                \
++           .TypeConstraint<T>("T")                                            \
++           .Label(mkl_op_registry::kMklLayoutDependentOpLabel),               \
++           MklConvCustomBackpropInputOp<CPUDevice, T, false>);                \
++  REGISTER_KERNEL_BUILDER(                                                    \
++      Name("_MklConv3DBackpropInputV2")                                       \
++           .Device(DEVICE_CPU)                                                \
++           .TypeConstraint<T>("T")                                            \
++           .Label(mkl_op_registry::kMklLayoutDependentOpLabel),               \
++           MklConvCustomBackpropInputOp<CPUDevice, T, false>);                \
++  REGISTER_KERNEL_BUILDER(                                                    \
++      Name("_MklDepthwiseConv2dNativeBackpropInput")                          \
++           .Device(DEVICE_CPU)                                                \
++           .TypeConstraint<T>("T")                                            \
++           .Label(mkl_op_registry::kMklLayoutDependentOpLabel),               \
++           MklConvCustomBackpropInputOp<CPUDevice, T, true>);
++
+ TF_CALL_float(REGISTER_MKL_CPU_KERNELS);
+ TF_CALL_bfloat16(REGISTER_MKL_CPU_KERNELS);
+ #undef REGISTER_MKL_CPU_KERNELS
+diff --git a/tensorflow/core/kernels/mkl_conv_ops.cc b/tensorflow/core/kernels/mkl_conv_ops.cc
+index e406081d48..749e6c8962 100644
+--- a/tensorflow/core/kernels/mkl_conv_ops.cc
++++ b/tensorflow/core/kernels/mkl_conv_ops.cc
+@@ -1775,49 +1775,51 @@ REGISTER_KERNEL_BUILDER(
+       Name("_MklConv2D")                                                \
+           .Device(DEVICE_CPU)                                           \
+           .TypeConstraint<T>("T")                                       \
+-          .Label(mkl_op_registry::kMklOpLabel),                         \
++          .Label(mkl_op_registry::kMklLayoutDependentOpLabel),          \
+       MklConvOp<CPUDevice, T, T, T, T, T, int32, false, false, false>); \
+   REGISTER_KERNEL_BUILDER(                                              \
+       Name("_MklConv2DWithBias")                                        \
+           .Device(DEVICE_CPU)                                           \
+           .TypeConstraint<T>("T")                                       \
+-          .Label(mkl_op_registry::kMklOpLabel),                         \
++          .Label(mkl_op_registry::kMklLayoutDependentOpLabel),          \
+       MklConvOp<CPUDevice, T, T, T, T, T, int32, true, false, false>);  \
+-  REGISTER_KERNEL_BUILDER(Name("__MklDummyConv2DWithBias")              \
+-                              .Device(DEVICE_CPU)                       \
+-                              .TypeConstraint<T>("T")                   \
+-                              .Label(mkl_op_registry::kMklOpLabel),     \
+-                          MklDummyOp<CPUDevice, T>);                    \
++  REGISTER_KERNEL_BUILDER(                                              \
++      Name("__MklDummyConv2DWithBias")                                  \
++           .Device(DEVICE_CPU)                                          \
++           .TypeConstraint<T>("T")                                      \
++           .Label(mkl_op_registry::kMklLayoutDependentOpLabel),         \
++           MklDummyOp<CPUDevice, T>);                                   \
+   REGISTER_KERNEL_BUILDER(                                              \
+       Name("_MklPadWithConv2D")                                         \
+           .Device(DEVICE_CPU)                                           \
+           .TypeConstraint<T>("T")                                       \
+           .TypeConstraint<int32>("Tpaddings")                           \
+-          .Label(mkl_op_registry::kMklOpLabel),                         \
++          .Label(mkl_op_registry::kMklLayoutDependentOpLabel),          \
+       MklConvOp<CPUDevice, T, T, T, T, T, int32, false, true, false>);  \
+   REGISTER_KERNEL_BUILDER(                                              \
+       Name("_MklPadWithConv2D")                                         \
+           .Device(DEVICE_CPU)                                           \
+           .TypeConstraint<T>("T")                                       \
+           .TypeConstraint<int64>("Tpaddings")                           \
+-          .Label(mkl_op_registry::kMklOpLabel),                         \
++          .Label(mkl_op_registry::kMklLayoutDependentOpLabel),          \
+       MklConvOp<CPUDevice, T, T, T, T, T, int64, false, true, false>);  \
+-  REGISTER_KERNEL_BUILDER(Name("__MklDummyPadWithConv2D")               \
+-                              .Device(DEVICE_CPU)                       \
+-                              .TypeConstraint<T>("T")                   \
+-                              .TypeConstraint<int32>("Tpaddings")       \
+-                              .Label(mkl_op_registry::kMklOpLabel),     \
+-                          MklDummyOp<CPUDevice, T>);
++  REGISTER_KERNEL_BUILDER(                                              \
++      Name("__MklDummyPadWithConv2D")                                   \
++           .Device(DEVICE_CPU)                                          \
++           .TypeConstraint<T>("T")                                      \
++           .TypeConstraint<int32>("Tpaddings")                          \
++           .Label(mkl_op_registry::kMklLayoutDependentOpLabel),         \
++           MklDummyOp<CPUDevice, T>);
+ 
+ TF_CALL_float(REGISTER_MKL_CPU_2D);
+ TF_CALL_bfloat16(REGISTER_MKL_CPU_2D);
+ 
+-#define REGISTER_MKL_CPU_2D_DEPTHWISE(T)        \
+-  REGISTER_KERNEL_BUILDER(                      \
+-      Name("_MklDepthwiseConv2dNative")         \
+-          .Device(DEVICE_CPU)                   \
+-          .TypeConstraint<T>("T")               \
+-          .Label(mkl_op_registry::kMklOpLabel), \
++#define REGISTER_MKL_CPU_2D_DEPTHWISE(T)                                \
++  REGISTER_KERNEL_BUILDER(                                              \
++      Name("_MklDepthwiseConv2dNative")                                 \
++          .Device(DEVICE_CPU)                                           \
++          .TypeConstraint<T>("T")                                       \
++          .Label(mkl_op_registry::kMklLayoutDependentOpLabel),          \
+       MklConvOp<CPUDevice, T, T, T, T, T, int32, false, false, true>);
+ 
+ TF_CALL_float(REGISTER_MKL_CPU_2D_DEPTHWISE);
+@@ -1825,33 +1827,34 @@ TF_CALL_bfloat16(REGISTER_MKL_CPU_2D_DEPTHWISE);
+ 
+ // Note we are registering _MklFusedConv2D.
+ // We check the fused_ops attributes to decide if bias is enabled or not.
+-#define REGISTER_MKL_CPU_2D_FUSED(T)                                \
+-  REGISTER_KERNEL_BUILDER(                                          \
+-      Name("_MklFusedConv2D")                                       \
+-          .Device(DEVICE_CPU)                                       \
+-          .TypeConstraint<T>("T")                                   \
+-          .Label(mkl_op_registry::kMklOpLabel),                     \
+-      MklFusedConvOp<CPUDevice, T, T, T, T, T, int32, false>);      \
+-  REGISTER_KERNEL_BUILDER(                                          \
+-      Name("_MklPadWithFusedConv2D")                                \
+-          .Device(DEVICE_CPU)                                       \
+-          .TypeConstraint<int32>("Tpaddings")                       \
+-          .TypeConstraint<T>("T")                                   \
+-          .Label(mkl_op_registry::kMklOpLabel),                     \
+-      MklFusedConvOp<CPUDevice, T, T, T, T, T, int32, true>);       \
+-  REGISTER_KERNEL_BUILDER(                                          \
+-      Name("_MklPadWithFusedConv2D")                                \
+-          .Device(DEVICE_CPU)                                       \
+-          .TypeConstraint<T>("T")                                   \
+-          .TypeConstraint<int64>("Tpaddings")                       \
+-          .Label(mkl_op_registry::kMklOpLabel),                     \
+-      MklFusedConvOp<CPUDevice, T, T, T, T, T, int64, true>);       \
+-  REGISTER_KERNEL_BUILDER(Name("__MklDummyPadWithFusedConv2D")      \
+-                              .Device(DEVICE_CPU)                   \
+-                              .TypeConstraint<T>("T")               \
+-                              .TypeConstraint<int32>("Tpaddings")   \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklDummyOp<CPUDevice, T>);
++#define REGISTER_MKL_CPU_2D_FUSED(T)                                    \
++  REGISTER_KERNEL_BUILDER(                                              \
++      Name("_MklFusedConv2D")                                           \
++          .Device(DEVICE_CPU)                                           \
++          .TypeConstraint<T>("T")                                       \
++          .Label(mkl_op_registry::kMklLayoutDependentOpLabel),          \
++      MklFusedConvOp<CPUDevice, T, T, T, T, T, int32, false>);          \
++  REGISTER_KERNEL_BUILDER(                                              \
++      Name("_MklPadWithFusedConv2D")                                    \
++          .Device(DEVICE_CPU)                                           \
++          .TypeConstraint<int32>("Tpaddings")                           \
++          .TypeConstraint<T>("T")                                       \
++          .Label(mkl_op_registry::kMklLayoutDependentOpLabel),          \
++      MklFusedConvOp<CPUDevice, T, T, T, T, T, int32, true>);           \
++  REGISTER_KERNEL_BUILDER(                                              \
++      Name("_MklPadWithFusedConv2D")                                    \
++          .Device(DEVICE_CPU)                                           \
++          .TypeConstraint<T>("T")                                       \
++          .TypeConstraint<int64>("Tpaddings")                           \
++          .Label(mkl_op_registry::kMklLayoutDependentOpLabel),          \
++      MklFusedConvOp<CPUDevice, T, T, T, T, T, int64, true>);           \
++  REGISTER_KERNEL_BUILDER(                                              \
++      Name("__MklDummyPadWithFusedConv2D")                              \
++           .Device(DEVICE_CPU)                                          \
++           .TypeConstraint<T>("T")                                      \
++           .TypeConstraint<int32>("Tpaddings")                          \
++           .Label(mkl_op_registry::kMklLayoutDependentOpLabel),         \
++           MklDummyOp<CPUDevice, T>);
+ 
+ TF_CALL_float(REGISTER_MKL_CPU_2D_FUSED);
+ TF_CALL_bfloat16(REGISTER_MKL_CPU_2D_FUSED);
+@@ -1862,7 +1865,7 @@ TF_CALL_bfloat16(REGISTER_MKL_CPU_2D_FUSED);
+       Name("_MklConv3D")                        \
+           .Device(DEVICE_CPU)                   \
+           .TypeConstraint<T>("T")               \
+-          .Label(mkl_op_registry::kMklOpLabel), \
++          .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
+       MklConvOp<CPUDevice, T, T, T, T, T, int32, false, false, false>);
+ TF_CALL_float(REGISTER_MKL_CPU_3D);
+ TF_CALL_bfloat16(REGISTER_MKL_CPU_3D);
+diff --git a/tensorflow/core/kernels/mkl_cwise_ops_common.cc b/tensorflow/core/kernels/mkl_cwise_ops_common.cc
+index 080569bf76..c61c6e458c 100644
+--- a/tensorflow/core/kernels/mkl_cwise_ops_common.cc
++++ b/tensorflow/core/kernels/mkl_cwise_ops_common.cc
+@@ -61,11 +61,12 @@ class MklBinaryOp : public BinaryOp<Device, Functor> {
+ #pragma push_macro("REGISTER")
+ #undef REGISTER
+ #define REGISTER(OP, D, N, F, T)                                    \
+-  REGISTER_KERNEL_BUILDER(Name(N)                                   \
+-                              .Device(DEVICE_##D)                   \
+-                              .TypeConstraint<T>("T")               \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          OP<D##Device, F<T>>);
++  REGISTER_KERNEL_BUILDER(                                          \
++      Name(N)                                                       \
++           .Device(DEVICE_##D)                                      \
++           .TypeConstraint<T>("T")                                  \
++           .Label(mkl_op_registry::kMklLayoutDependentOpLabel),     \
++           OP<D##Device, F<T>>);
+ 
+ REGISTER6(MklBinaryOp, CPU, "_MklAdd", functor::add, float, Eigen::half, double,
+           int32, int64, bfloat16);
+diff --git a/tensorflow/core/kernels/mkl_fused_batch_norm_op.cc b/tensorflow/core/kernels/mkl_fused_batch_norm_op.cc
+index 6b6eaace8b..0c84cdc891 100644
+--- a/tensorflow/core/kernels/mkl_fused_batch_norm_op.cc
++++ b/tensorflow/core/kernels/mkl_fused_batch_norm_op.cc
+@@ -1120,46 +1120,50 @@ class MklFusedBatchNormGradOp : public OpKernel {
+ };
+ 
+ #define REGISTER_MKL_FUSED_BATCHNORM_CPU(T)                         \
+-  REGISTER_KERNEL_BUILDER(Name("_MklFusedBatchNorm")                \
+-                              .Device(DEVICE_CPU)                   \
+-                              .TypeConstraint<T>("T")               \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklFusedBatchNormOp<CPUDevice, T, T>);
++  REGISTER_KERNEL_BUILDER(                                          \
++      Name("_MklFusedBatchNorm")                                    \
++           .Device(DEVICE_CPU)                                      \
++           .TypeConstraint<T>("T")                                  \
++           .Label(mkl_op_registry::kMklLayoutDependentOpLabel),     \
++           MklFusedBatchNormOp<CPUDevice, T, T>);
+ 
+ TF_CALL_float(REGISTER_MKL_FUSED_BATCHNORM_CPU);
+ TF_CALL_bfloat16(REGISTER_MKL_FUSED_BATCHNORM_CPU);
+ #undef REGISTER_MKL_FUSED_BATCHNORM_CPU
+ 
+ #define REGISTER_MKL_FUSED_BATCHNORM_V2_CPU(T, U)                   \
+-  REGISTER_KERNEL_BUILDER(Name("_MklFusedBatchNormV2")              \
+-                              .Device(DEVICE_CPU)                   \
+-                              .TypeConstraint<T>("T")               \
+-                              .TypeConstraint<U>("U")               \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklFusedBatchNormOp<CPUDevice, T, U>);
++  REGISTER_KERNEL_BUILDER(                                          \
++      Name("_MklFusedBatchNormV2")                                  \
++           .Device(DEVICE_CPU)                                      \
++           .TypeConstraint<T>("T")                                  \
++           .TypeConstraint<U>("U")                                  \
++           .Label(mkl_op_registry::kMklLayoutDependentOpLabel),     \
++           MklFusedBatchNormOp<CPUDevice, T, U>);
+ 
+ REGISTER_MKL_FUSED_BATCHNORM_V2_CPU(float, float);
+ REGISTER_MKL_FUSED_BATCHNORM_V2_CPU(bfloat16, float);
+ #undef REGISTER_MKL_FUSED_BATCHNORM_V2_CPU
+ 
+ #define REGISTER_MKL_FUSED_BATCHNORM_GRAD_CPU(T)                    \
+-  REGISTER_KERNEL_BUILDER(Name("_MklFusedBatchNormGrad")            \
+-                              .Device(DEVICE_CPU)                   \
+-                              .TypeConstraint<T>("T")               \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklFusedBatchNormGradOp<CPUDevice, T, T>);
++  REGISTER_KERNEL_BUILDER(                                          \
++      Name("_MklFusedBatchNormGrad")                                \
++           .Device(DEVICE_CPU)                                      \
++           .TypeConstraint<T>("T")                                  \
++           .Label(mkl_op_registry::kMklLayoutDependentOpLabel),     \
++           MklFusedBatchNormGradOp<CPUDevice, T, T>);
+ 
+ TF_CALL_float(REGISTER_MKL_FUSED_BATCHNORM_GRAD_CPU);
+ TF_CALL_bfloat16(REGISTER_MKL_FUSED_BATCHNORM_GRAD_CPU);
+ #undef REGISTER_MKL_FUSED_BATCHNORM_GRAD_CPU
+ 
+ #define REGISTER_MKL_FUSED_BATCHNORM_GRAD_V2_CPU(T, U)              \
+-  REGISTER_KERNEL_BUILDER(Name("_MklFusedBatchNormGradV2")          \
+-                              .Device(DEVICE_CPU)                   \
+-                              .TypeConstraint<T>("T")               \
+-                              .TypeConstraint<U>("U")               \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklFusedBatchNormGradOp<CPUDevice, T, U>);
++  REGISTER_KERNEL_BUILDER(                                          \
++      Name("_MklFusedBatchNormGradV2")                              \
++           .Device(DEVICE_CPU)                                      \
++           .TypeConstraint<T>("T")                                  \
++           .TypeConstraint<U>("U")                                  \
++           .Label(mkl_op_registry::kMklLayoutDependentOpLabel),     \
++           MklFusedBatchNormGradOp<CPUDevice, T, U>);
+ 
+ REGISTER_MKL_FUSED_BATCHNORM_GRAD_V2_CPU(float, float);
+ REGISTER_MKL_FUSED_BATCHNORM_GRAD_V2_CPU(bfloat16, float);
+diff --git a/tensorflow/core/kernels/mkl_fused_ops_test.cc b/tensorflow/core/kernels/mkl_fused_ops_test.cc
+index 288515de0b..02c481fcb0 100644
+--- a/tensorflow/core/kernels/mkl_fused_ops_test.cc
++++ b/tensorflow/core/kernels/mkl_fused_ops_test.cc
+@@ -52,7 +52,7 @@ class CommonTestUtilities : public OpsTestBase {
+                      .Input(FakeInput(dtype))     // Input
+                      .Input(FakeInput(DT_UINT8))  // Mkl second tensor
+                      .Attr("T", dtype)
+-                     .Attr("_kernel", "MklOp")
++                     .Attr("_kernel", "MklLayoutDependentOp")
+                      .Finalize(node_def()));
+     TF_EXPECT_OK(InitOp());
+     AddInputFromArray<T>(tensor.shape(), tensor.flat<T>());
+@@ -187,7 +187,7 @@ class MklFusedConv2DOpTest : public OpsTestBase {
+                      .Attr("strides", {1, stride, stride, 1})
+                      .Attr("padding", "SAME")
+                      .Attr("fused_ops", fused_ops)
+-                     .Attr("_kernel", "MklOp")
++                     .Attr("_kernel", "MklLayoutDependentOp")
+                      .Finalize(node_def()));
+ 
+     TF_EXPECT_OK(InitOp());
+@@ -325,7 +325,7 @@ class FusedPadConvOpTest : public OpsTestBase {
+                      .Attr("data_format", data_format)
+                      .Attr("T", dtype)
+                      .Attr("strides", {1, stride, stride, 1})
+-                     .Attr("_kernel", "MklOp")
++                     .Attr("_kernel", "MklLayoutDependentOp")
+                      .Finalize(node_def()));
+     TF_EXPECT_OK(InitOp());
+ 
+@@ -419,7 +419,7 @@ class FilterCacheTest : public OpsTestBase {
+                      .Attr("is_filter_const", is_filter_const)
+                      .Attr("T", dtype)
+                      .Attr("strides", {1, stride, stride, 1})
+-                     .Attr("_kernel", "MklOp")
++                     .Attr("_kernel", "MklLayoutDependentOp")
+                      .Finalize(node_def()));
+     TF_EXPECT_OK(InitOp());
+ 
+@@ -617,7 +617,7 @@ class MklPadWithFusedConv2DOpTest : public OpsTestBase {
+                      .Attr("strides", {1, stride, stride, 1})
+                      .Attr("padding", "VALID")
+                      .Attr("fused_ops", fused_ops)
+-                     .Attr("_kernel", "MklOp")
++                     .Attr("_kernel", "MklLayoutDependentOp")
+                      .Finalize(node_def()));
+ 
+     TF_EXPECT_OK(InitOp());
+diff --git a/tensorflow/core/kernels/mkl_identity_op.cc b/tensorflow/core/kernels/mkl_identity_op.cc
+index f9f58416a5..756bee5c2d 100644
+--- a/tensorflow/core/kernels/mkl_identity_op.cc
++++ b/tensorflow/core/kernels/mkl_identity_op.cc
+@@ -53,11 +53,12 @@ class MklIdentityOp : public OpKernel {
+ };
+ 
+ #define REGISTER_MKL_CPU(T)                                         \
+-  REGISTER_KERNEL_BUILDER(Name("_MklIdentity")                      \
+-                              .Device(DEVICE_CPU)                   \
+-                              .TypeConstraint<T>("T")               \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklIdentityOp<CPUDevice, T>);
++  REGISTER_KERNEL_BUILDER(                                          \
++      Name("_MklIdentity")                                          \
++           .Device(DEVICE_CPU)                                      \
++           .TypeConstraint<T>("T")                                  \
++           .Label(mkl_op_registry::kMklLayoutDependentOpLabel),     \
++           MklIdentityOp<CPUDevice, T>);
+ 
+ TF_CALL_float(REGISTER_MKL_CPU);
+ TF_CALL_bfloat16(REGISTER_MKL_CPU);
+diff --git a/tensorflow/core/kernels/mkl_input_conversion_op.cc b/tensorflow/core/kernels/mkl_input_conversion_op.cc
+index f14b811b34..d36f993971 100644
+--- a/tensorflow/core/kernels/mkl_input_conversion_op.cc
++++ b/tensorflow/core/kernels/mkl_input_conversion_op.cc
+@@ -296,11 +296,12 @@ class MklInputConversionOp : public OpKernel {
+ ///////////////////////////////////////////////////////////
+ 
+ #define REGISTER_CPU(T)                                             \
+-  REGISTER_KERNEL_BUILDER(Name("_MklInputConversion")               \
+-                              .Device(DEVICE_CPU)                   \
+-                              .TypeConstraint<T>("T")               \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklInputConversionOp<CPUDevice, T>);
++  REGISTER_KERNEL_BUILDER(                                          \
++      Name("_MklInputConversion")                                   \
++           .Device(DEVICE_CPU)                                      \
++           .TypeConstraint<T>("T")                                  \
++           .Label(mkl_op_registry::kMklLayoutDependentOpLabel),     \
++           MklInputConversionOp<CPUDevice, T>);
+ 
+ // TODO(nhasabni): We cannot support all number types since MklDnn does
+ // not support types.
+diff --git a/tensorflow/core/kernels/mkl_lrn_op.cc b/tensorflow/core/kernels/mkl_lrn_op.cc
+index bc52127b94..0a59059095 100644
+--- a/tensorflow/core/kernels/mkl_lrn_op.cc
++++ b/tensorflow/core/kernels/mkl_lrn_op.cc
+@@ -672,16 +672,18 @@ class MklLRNGradOp : public OpKernel {
+ };
+ 
+ #define REGISTER_MKL_LRN_CPU(T)                                     \
+-  REGISTER_KERNEL_BUILDER(Name("_MklLRN")                           \
+-                              .Device(DEVICE_CPU)                   \
+-                              .TypeConstraint<T>("T")               \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklLRNOp<T>);                             \
+-  REGISTER_KERNEL_BUILDER(Name("_MklLRNGrad")                       \
+-                              .Device(DEVICE_CPU)                   \
+-                              .TypeConstraint<T>("T")               \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklLRNGradOp<T>);
++  REGISTER_KERNEL_BUILDER(                                          \
++      Name("_MklLRN")                                               \
++           .Device(DEVICE_CPU)                                      \
++           .TypeConstraint<T>("T")                                  \
++           .Label(mkl_op_registry::kMklLayoutDependentOpLabel),     \
++           MklLRNOp<T>);                                            \
++  REGISTER_KERNEL_BUILDER(                                          \
++      Name("_MklLRNGrad")                                           \
++           .Device(DEVICE_CPU)                                      \
++           .TypeConstraint<T>("T")                                  \
++           .Label(mkl_op_registry::kMklLayoutDependentOpLabel),     \
++           MklLRNGradOp<T>);
+ 
+ TF_CALL_float(REGISTER_MKL_LRN_CPU);
+ 
+diff --git a/tensorflow/core/kernels/mkl_matmul_op.cc b/tensorflow/core/kernels/mkl_matmul_op.cc
+index 766a3ea907..aa0bed5ffb 100644
+--- a/tensorflow/core/kernels/mkl_matmul_op.cc
++++ b/tensorflow/core/kernels/mkl_matmul_op.cc
+@@ -29,6 +29,7 @@ limitations under the License.
+ #include "tensorflow/core/framework/op_kernel.h"
+ #include "tensorflow/core/framework/register_types.h"
+ #include "tensorflow/core/kernels/fill_functor.h"
++#include "tensorflow/core/util/mkl_util.h"
+ 
+ // This header file is part of MKL ML, need equivalent file in MKL DNN
+ #ifndef INTEL_MKL_DNN_ONLY
+@@ -220,9 +221,12 @@ class MklMatMulOp : public OpKernel {
+ #endif  // !INTEL_MKL_DNN_ONLY
+ };
+ 
+-#define REGISTER_CPU(T)                                         \
+-  REGISTER_KERNEL_BUILDER(                                      \
+-      Name("MatMul").Device(DEVICE_CPU).TypeConstraint<T>("T"), \
++#define REGISTER_CPU(T)                                                \
++  REGISTER_KERNEL_BUILDER(                                             \
++      Name("_MklMatMul")                                               \
++          .Device(DEVICE_CPU)                                          \
++          .TypeConstraint<T>("T")                                      \
++          .Label(mkl_op_registry::kMklNameChangeOpLabel),              \
+       MklMatMulOp<CPUDevice, T, false /* cublas, ignored for CPU */>);
+ 
+ #ifdef ENABLE_MKL
+diff --git a/tensorflow/core/kernels/mkl_maxpooling_op.cc b/tensorflow/core/kernels/mkl_maxpooling_op.cc
+index 0e30eb5355..d26b6c53fb 100644
+--- a/tensorflow/core/kernels/mkl_maxpooling_op.cc
++++ b/tensorflow/core/kernels/mkl_maxpooling_op.cc
+@@ -409,13 +409,13 @@ class MklMaxPoolingGradOp : public MklPoolingBackwardOpBase<T> {
+   REGISTER_KERNEL_BUILDER(Name("_MklMaxPool3D")                     \
+                               .Device(DEVICE_CPU)                   \
+                               .TypeConstraint<T>("T")               \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklMaxPoolingOp<CPUDevice, T>);           \
++               .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
++               MklMaxPoolingOp<CPUDevice, T>);                      \
+   REGISTER_KERNEL_BUILDER(Name("_MklMaxPool3DGrad")                 \
+                               .Device(DEVICE_CPU)                   \
+                               .TypeConstraint<T>("T")               \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklMaxPoolingGradOp<CPUDevice, T>);
++               .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
++               MklMaxPoolingGradOp<CPUDevice, T>);
+ 
+ TF_CALL_float(REGISTER_MKL_MAXPOOL3D_KERNELS);
+ TF_CALL_bfloat16(REGISTER_MKL_MAXPOOL3D_KERNELS);
+@@ -424,13 +424,13 @@ TF_CALL_bfloat16(REGISTER_MKL_MAXPOOL3D_KERNELS);
+   REGISTER_KERNEL_BUILDER(Name("_MklMaxPool")                       \
+                               .Device(DEVICE_CPU)                   \
+                               .TypeConstraint<T>("T")               \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklMaxPoolingOp<CPUDevice, T>);           \
++               .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
++               MklMaxPoolingOp<CPUDevice, T>);                      \
+   REGISTER_KERNEL_BUILDER(Name("_MklMaxPoolGrad")                   \
+                               .Device(DEVICE_CPU)                   \
+                               .TypeConstraint<T>("T")               \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklMaxPoolingGradOp<CPUDevice, T>);
++               .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
++               MklMaxPoolingGradOp<CPUDevice, T>);
+ 
+ TF_CALL_float(REGISTER_MKL_MAXPOOL_KERNELS);
+ TF_CALL_bfloat16(REGISTER_MKL_MAXPOOL_KERNELS);
+diff --git a/tensorflow/core/kernels/mkl_quantized_conv_ops_perchannel_test.cc b/tensorflow/core/kernels/mkl_quantized_conv_ops_perchannel_test.cc
+index dcef8360f0..b34fcca381 100644
+--- a/tensorflow/core/kernels/mkl_quantized_conv_ops_perchannel_test.cc
++++ b/tensorflow/core/kernels/mkl_quantized_conv_ops_perchannel_test.cc
+@@ -53,7 +53,7 @@ class ConvMklToTF : public OpsTestBase {
+                      .Input(FakeInput(dtype))     // Input
+                      .Input(FakeInput(DT_UINT8))  // MKL second tensor
+                      .Attr("T", dtype)
+-                     .Attr("_kernel", "MklOp")
++                     .Attr("_kernel", "MklLayoutDependentOp")
+                      .Finalize(node_def()));
+     TF_EXPECT_OK(InitOp());
+     AddInputFromArray<T>(first.shape(), first.flat<T>());
+diff --git a/tensorflow/core/kernels/mkl_quantized_conv_ops_test.cc b/tensorflow/core/kernels/mkl_quantized_conv_ops_test.cc
+index 91eb260889..d9a521cef9 100644
+--- a/tensorflow/core/kernels/mkl_quantized_conv_ops_test.cc
++++ b/tensorflow/core/kernels/mkl_quantized_conv_ops_test.cc
+@@ -55,7 +55,7 @@ class ConvMklToTF : public OpsTestBase {
+                      .Input(FakeInput(dtype))     // Input
+                      .Input(FakeInput(DT_UINT8))  // MKL metadata tensor
+                      .Attr("T", dtype)
+-                     .Attr("_kernel", "MklOp")
++                     .Attr("_kernel", "MklLayoutDependentOp")
+                      .Finalize(node_def()));
+     TF_EXPECT_OK(InitOp());
+     AddInputFromArray<T>(input.shape(), input.flat<T>());
+diff --git a/tensorflow/core/kernels/mkl_quantized_pooling_ops_test.cc b/tensorflow/core/kernels/mkl_quantized_pooling_ops_test.cc
+index 7c1e32d6e3..ba771a5422 100644
+--- a/tensorflow/core/kernels/mkl_quantized_pooling_ops_test.cc
++++ b/tensorflow/core/kernels/mkl_quantized_pooling_ops_test.cc
+@@ -47,7 +47,7 @@ class ConvMklToTF : public OpsTestBase {
+                      .Input(FakeInput(dtype))     // Input
+                      .Input(FakeInput(DT_UINT8))  // Mkl second tensor
+                      .Attr("T", dtype)
+-                     .Attr("_kernel", "MklOp")
++                     .Attr("_kernel", "MklLayoutDependentOp")
+                      .Finalize(node_def()));
+     TF_EXPECT_OK(InitOp());
+     AddInputFromArray<T>(first.shape(), first.flat<T>());
+diff --git a/tensorflow/core/kernels/mkl_relu_op.cc b/tensorflow/core/kernels/mkl_relu_op.cc
+index c9d740c9e2..8bb8a53307 100644
+--- a/tensorflow/core/kernels/mkl_relu_op.cc
++++ b/tensorflow/core/kernels/mkl_relu_op.cc
+@@ -1073,13 +1073,13 @@ class MklLeakyReluGradOp : public MklReluGradOpBase<Device, T, eltwise_relu> {
+   REGISTER_KERNEL_BUILDER(Name("_MklRelu")                          \
+                               .Device(DEVICE_CPU)                   \
+                               .TypeConstraint<type>("T")            \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklReluOp<CPUDevice, type>);              \
++               .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
++               MklReluOp<CPUDevice, type>);                         \
+   REGISTER_KERNEL_BUILDER(Name("_MklReluGrad")                      \
+                               .Device(DEVICE_CPU)                   \
+                               .TypeConstraint<type>("T")            \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklReluGradOp<CPUDevice, type>);
++               .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
++               MklReluGradOp<CPUDevice, type>);
+ TF_CALL_float(REGISTER_RELU_MKL_SUPPORTED_KERNELS_TYPES);
+ TF_CALL_bfloat16(REGISTER_RELU_MKL_SUPPORTED_KERNELS_TYPES);
+ 
+@@ -1088,13 +1088,13 @@ TF_CALL_bfloat16(REGISTER_RELU_MKL_SUPPORTED_KERNELS_TYPES);
+   REGISTER_KERNEL_BUILDER(Name("_MklElu")                           \
+                               .Device(DEVICE_CPU)                   \
+                               .TypeConstraint<type>("T")            \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklEluOp<CPUDevice, type>);               \
++               .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
++               MklEluOp<CPUDevice, type>);                          \
+   REGISTER_KERNEL_BUILDER(Name("_MklEluGrad")                       \
+                               .Device(DEVICE_CPU)                   \
+                               .TypeConstraint<type>("T")            \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklEluGradOp<CPUDevice, type>);
++               .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
++               MklEluGradOp<CPUDevice, type>);
+ TF_CALL_float(REGISTER_ELU_MKL_SUPPORTED_KERNELS_TYPES);
+ TF_CALL_bfloat16(REGISTER_ELU_MKL_SUPPORTED_KERNELS_TYPES);
+ 
+@@ -1102,13 +1102,13 @@ TF_CALL_bfloat16(REGISTER_ELU_MKL_SUPPORTED_KERNELS_TYPES);
+   REGISTER_KERNEL_BUILDER(Name("_MklTanh")                          \
+                               .Device(DEVICE_CPU)                   \
+                               .TypeConstraint<type>("T")            \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklTanhOp<CPUDevice, type>);              \
++               .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
++               MklTanhOp<CPUDevice, type>);                         \
+   REGISTER_KERNEL_BUILDER(Name("_MklTanhGrad")                      \
+                               .Device(DEVICE_CPU)                   \
+                               .TypeConstraint<type>("T")            \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklTanhGradOp<CPUDevice, type>);
++               .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
++               MklTanhGradOp<CPUDevice, type>);
+ TF_CALL_float(REGISTER_TANH_MKL_SUPPORTED_KERNELS_TYPES);
+ TF_CALL_bfloat16(REGISTER_TANH_MKL_SUPPORTED_KERNELS_TYPES);
+ 
+@@ -1116,13 +1116,13 @@ TF_CALL_bfloat16(REGISTER_TANH_MKL_SUPPORTED_KERNELS_TYPES);
+   REGISTER_KERNEL_BUILDER(Name("_MklRelu6")                         \
+                               .Device(DEVICE_CPU)                   \
+                               .TypeConstraint<type>("T")            \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklRelu6Op<CPUDevice, type>);             \
++               .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
++               MklRelu6Op<CPUDevice, type>);                        \
+   REGISTER_KERNEL_BUILDER(Name("_MklRelu6Grad")                     \
+                               .Device(DEVICE_CPU)                   \
+                               .TypeConstraint<type>("T")            \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklRelu6GradOp<CPUDevice, type>);
++               .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
++               MklRelu6GradOp<CPUDevice, type>);
+ TF_CALL_float(REGISTER_RELU6_MKL_SUPPORTED_KERNELS_TYPES);
+ TF_CALL_bfloat16(REGISTER_RELU6_MKL_SUPPORTED_KERNELS_TYPES);
+ 
+@@ -1130,13 +1130,13 @@ TF_CALL_bfloat16(REGISTER_RELU6_MKL_SUPPORTED_KERNELS_TYPES);
+   REGISTER_KERNEL_BUILDER(Name("_MklLeakyRelu")                     \
+                               .Device(DEVICE_CPU)                   \
+                               .TypeConstraint<type>("T")            \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklLeakyReluOp<CPUDevice, type>);         \
++               .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
++               MklLeakyReluOp<CPUDevice, type>);                    \
+   REGISTER_KERNEL_BUILDER(Name("_MklLeakyReluGrad")                 \
+                               .Device(DEVICE_CPU)                   \
+                               .TypeConstraint<type>("T")            \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklLeakyReluGradOp<CPUDevice, type>);
++               .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
++               MklLeakyReluGradOp<CPUDevice, type>);
+ TF_CALL_float(REGISTER_LeakyRelu_MKL_SUPPORTED_KERNELS_TYPES);
+ TF_CALL_bfloat16(REGISTER_LeakyRelu_MKL_SUPPORTED_KERNELS_TYPES);
+ 
+diff --git a/tensorflow/core/kernels/mkl_reshape_op.cc b/tensorflow/core/kernels/mkl_reshape_op.cc
+index 58e76805af..637d50d959 100644
+--- a/tensorflow/core/kernels/mkl_reshape_op.cc
++++ b/tensorflow/core/kernels/mkl_reshape_op.cc
+@@ -268,21 +268,17 @@ class MklReshapeOp : public OpKernel {
+   }
+ };
+ 
+-#define REGISTER_MKL_CPU(T)                                         \
+-  REGISTER_KERNEL_BUILDER(Name("_MklReshape")                       \
+-                              .Device(DEVICE_CPU)                   \
+-                              .HostMemory("shape")                  \
+-                              .TypeConstraint<T>("T")               \
+-                              .TypeConstraint<int32>("Tshape")      \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklReshapeOp<CPUDevice, T>);              \
+-  REGISTER_KERNEL_BUILDER(Name("_MklReshape")                       \
+-                              .Device(DEVICE_CPU)                   \
+-                              .HostMemory("shape")                  \
+-                              .TypeConstraint<T>("T")               \
+-                              .TypeConstraint<int64>("Tshape")      \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklReshapeOp<CPUDevice, T>);
++
++#define REGISTER_MKL_CPU(T)                                    \
++  REGISTER_KERNEL_BUILDER(                                     \
++      Name("_MklReshape")                                      \
++          .Device(DEVICE_CPU)                                  \
++          .HostMemory("shape")                                 \
++          .TypeConstraint<T>("T")                              \
++          .TypeConstraint("Tshape", {DT_INT32, DT_INT64})      \
++          .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
++      MklReshapeOp<CPUDevice, T>);
++
+ TF_CALL_float(REGISTER_MKL_CPU);
+ TF_CALL_bfloat16(REGISTER_MKL_CPU);
+ #undef REGISTER_MKL_CPU
+diff --git a/tensorflow/core/kernels/mkl_slice_op.cc b/tensorflow/core/kernels/mkl_slice_op.cc
+index 5d238a24bc..b259c284fa 100644
+--- a/tensorflow/core/kernels/mkl_slice_op.cc
++++ b/tensorflow/core/kernels/mkl_slice_op.cc
+@@ -473,14 +473,15 @@ class MklSliceOp : public OpKernel {
+ };
+ 
+ // MKL-DNN Slice registration
+-#define REGISTER_MKL_SLICE(type)                                    \
+-  REGISTER_KERNEL_BUILDER(Name("_MklSlice")                         \
+-                              .Device(DEVICE_CPU)                   \
+-                              .TypeConstraint<type>("T")            \
+-                              .HostMemory("begin")                  \
+-                              .HostMemory("size")                   \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklSliceOp<CPUDevice, type>);
++#define REGISTER_MKL_SLICE(type)                               \
++  REGISTER_KERNEL_BUILDER(                                     \
++      Name("_MklSlice")                                        \
++          .Device(DEVICE_CPU)                                  \
++          .TypeConstraint<type>("T")                           \
++          .HostMemory("begin")                                 \
++          .HostMemory("size")                                  \
++          .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
++      MklSliceOp<CPUDevice, type>);
+ 
+ TF_CALL_float(REGISTER_MKL_SLICE);
+ TF_CALL_bfloat16(REGISTER_MKL_SLICE);
+diff --git a/tensorflow/core/kernels/mkl_softmax_op.cc b/tensorflow/core/kernels/mkl_softmax_op.cc
+index dc3ae3d934..a3364fd6f5 100644
+--- a/tensorflow/core/kernels/mkl_softmax_op.cc
++++ b/tensorflow/core/kernels/mkl_softmax_op.cc
+@@ -182,12 +182,13 @@ class MklSoftmaxOp : public OpKernel {
+ 
+ /* Register DNN kernels for supported operations and supported types - right now
+  * it is only Softmax and f32 */
+-#define REGISTER_SOFTMAX_MKL_SUPPORTED_KERNELS_TYPES(type)          \
+-  REGISTER_KERNEL_BUILDER(Name("_MklSoftmax")                       \
+-                              .Device(DEVICE_CPU)                   \
+-                              .TypeConstraint<type>("T")            \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklSoftmaxOp<CPUDevice, type>);
++#define REGISTER_SOFTMAX_MKL_SUPPORTED_KERNELS_TYPES(type)     \
++  REGISTER_KERNEL_BUILDER(                                     \
++      Name("_MklSoftmax")                                      \
++          .Device(DEVICE_CPU)                                  \
++          .TypeConstraint<type>("T")                           \
++          .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
++      MklSoftmaxOp<CPUDevice, type>);
+ TF_CALL_float(REGISTER_SOFTMAX_MKL_SUPPORTED_KERNELS_TYPES);
+ 
+ }  // namespace tensorflow
+diff --git a/tensorflow/core/kernels/mkl_tfconv_op.h b/tensorflow/core/kernels/mkl_tfconv_op.h
+index 665ec4c807..bd92b21e1a 100644
+--- a/tensorflow/core/kernels/mkl_tfconv_op.h
++++ b/tensorflow/core/kernels/mkl_tfconv_op.h
+@@ -133,12 +133,13 @@ class MklToTfOp : public OpKernel {
+ //               Register kernel
+ ///////////////////////////////////////////////////////////
+ 
+-#define REGISTER_CPU(T)                                             \
+-  REGISTER_KERNEL_BUILDER(Name("_MklToTf")                          \
+-                              .Device(DEVICE_CPU)                   \
+-                              .TypeConstraint<T>("T")               \
+-                              .Label(mkl_op_registry::kMklOpLabel), \
+-                          MklToTfOp<CPUDevice, T>);
++#define REGISTER_CPU(T)                                        \
++  REGISTER_KERNEL_BUILDER(                                     \
++      Name("_MklToTf")                                         \
++          .Device(DEVICE_CPU)                                  \
++          .TypeConstraint<T>("T")                              \
++          .Label(mkl_op_registry::kMklLayoutDependentOpLabel), \
++      MklToTfOp<CPUDevice, T>);
+ 
+ TF_CALL_NUMBER_TYPES(REGISTER_CPU);
+ TF_CALL_QUANTIZED_TYPES(REGISTER_CPU);
+diff --git a/tensorflow/core/kernels/mkl_transpose_op.cc b/tensorflow/core/kernels/mkl_transpose_op.cc
+index d3025d34d8..3224cce4e5 100644
+--- a/tensorflow/core/kernels/mkl_transpose_op.cc
++++ b/tensorflow/core/kernels/mkl_transpose_op.cc
+@@ -22,6 +22,7 @@ limitations under the License.
+ #include "mkl_trans.h"
+ #endif
+ 
++#include "tensorflow/core/framework/register_types.h"
+ #include "tensorflow/core/kernels/transpose_functor.h"
+ #include "tensorflow/core/kernels/transpose_op.h"
+ 
+@@ -248,6 +249,25 @@ Status MklConjugateTransposeCpuOp::DoTranspose(OpKernelContext* ctx,
+                                             perm, out);
+ }
+ 
++#define REGISTER(T)                                       \
++  REGISTER_KERNEL_BUILDER(                                \
++      Name("_MklTranspose")                               \
++          .Device(DEVICE_CPU)                             \
++          .TypeConstraint<T>("T")                         \
++          .HostMemory("perm")                             \
++          .Label(mkl_op_registry::kMklNameChangeOpLabel), \
++      MklTransposeCpuOp);                                 \
++  REGISTER_KERNEL_BUILDER(                                \
++      Name("_MklConjugateTranspose")                      \
++          .Device(DEVICE_CPU)                             \
++          .TypeConstraint<T>("T")                         \
++          .HostMemory("perm")                             \
++          .Label(mkl_op_registry::kMklNameChangeOpLabel), \
++      MklConjugateTransposeCpuOp);
++
++TF_CALL_ALL_TYPES(REGISTER)
++#undef REGISTER
++
+ }  // namespace tensorflow
+ 
+ #endif  // INTEL_MKL
+diff --git a/tensorflow/core/kernels/transpose_op.cc b/tensorflow/core/kernels/transpose_op.cc
+index 1c0d70c333..b692e90792 100644
+--- a/tensorflow/core/kernels/transpose_op.cc
++++ b/tensorflow/core/kernels/transpose_op.cc
+@@ -218,20 +218,6 @@ Status ConjugateTransposeCpuOp::DoTranspose(OpKernelContext* ctx,
+                                             perm, out);
+ }
+ 
+-#if defined(INTEL_MKL) && defined(ENABLE_MKL)
+-#define REGISTER(T)                                   \
+-  REGISTER_KERNEL_BUILDER(Name("Transpose")           \
+-                              .Device(DEVICE_CPU)     \
+-                              .TypeConstraint<T>("T") \
+-                              .HostMemory("perm"),    \
+-                          MklTransposeCpuOp);         \
+-  REGISTER_KERNEL_BUILDER(Name("ConjugateTranspose")  \
+-                              .Device(DEVICE_CPU)     \
+-                              .TypeConstraint<T>("T") \
+-                              .HostMemory("perm"),    \
+-                          MklConjugateTransposeCpuOp);
+-
+-#else  // INTEL_MKL && ENABLE_MKL
+ #define REGISTER(T)                                   \
+   REGISTER_KERNEL_BUILDER(Name("Transpose")           \
+                               .Device(DEVICE_CPU)     \
+@@ -243,7 +229,6 @@ Status ConjugateTransposeCpuOp::DoTranspose(OpKernelContext* ctx,
+                               .TypeConstraint<T>("T") \
+                               .HostMemory("perm"),    \
+                           ConjugateTransposeCpuOp);
+-#endif  // INTEL_MKL && ENABLE_MKL
+ 
+ TF_CALL_ALL_TYPES(REGISTER)
+ #undef REGISTER
+diff --git a/tensorflow/core/lib/core/threadpool.cc b/tensorflow/core/lib/core/threadpool.cc
+index 83d1f48c6c..5aa77d9f38 100644
+--- a/tensorflow/core/lib/core/threadpool.cc
++++ b/tensorflow/core/lib/core/threadpool.cc
+@@ -29,6 +29,24 @@ limitations under the License.
+ 
+ namespace tensorflow {
+ namespace thread {
++	
++#ifdef INTEL_MKL
++bool DisableMKL() {
++  enum MklStatus { MKL_DEFAULT = 0, MKL_ON = 1, MKL_OFF = 2 };
++  static MklStatus status = MKL_DEFAULT;
++  if (status == MKL_DEFAULT) {
++    char* tf_disable_mkl = getenv("TF_DISABLE_MKL");
++    if ((tf_disable_mkl != NULL) && (std::stoi(tf_disable_mkl) == 1)) {
++      VLOG(2) << "TF-MKL: Disabling MKL";
++      status = MKL_OFF;
++    } else {
++      status = MKL_ON;
++    }
++  }
++  return status == MKL_OFF ? true : false;
++}
++#endif  // INTEL_MKL
++
+ 
+ struct EigenEnvironment {
+   typedef Thread EnvThread;
+@@ -51,6 +69,13 @@ struct EigenEnvironment {
+ 
+   EnvThread* CreateThread(std::function<void()> f) {
+     return env_->StartThread(thread_options_, name_, [=]() {
++	  #ifdef INTEL_MKL
++        if (DisableMKL()) {
++          // Set number of OMP threads to 1 to get the default behavior
++          // of non-MKL build.
++          omp_set_num_threads(1);
++        }
++      #endif
+       // Set the processor flag to flush denormals to zero.
+       port::ScopedFlushDenormal flush;
+       // Set the processor rounding mode to ROUND TO NEAREST.
+diff --git a/tensorflow/core/ops/array_ops.cc b/tensorflow/core/ops/array_ops.cc
+index 6be9aceb0b..62bed89e04 100644
+--- a/tensorflow/core/ops/array_ops.cc
++++ b/tensorflow/core/ops/array_ops.cc
+@@ -1323,6 +1323,16 @@ REGISTER_OP("Transpose")
+     .Attr("Tperm: {int32, int64} = DT_INT32")
+     .SetShapeFn(TransposeShapeFn);
+ 
++#ifdef INTEL_MKL
++REGISTER_OP("_MklTranspose")
++    .Input("x: T")
++    .Input("perm: Tperm")
++    .Output("y: T")
++    .Attr("T: type")
++    .Attr("Tperm: {int32, int64} = DT_INT32")
++    .SetShapeFn(TransposeShapeFn);
++#endif // INTEL_MKL
++
+ // --------------------------------------------------------------------------
+ REGISTER_OP("ConjugateTranspose")
+     .Input("x: T")
+@@ -1332,6 +1342,16 @@ REGISTER_OP("ConjugateTranspose")
+     .Attr("Tperm: {int32, int64} = DT_INT32")
+     .SetShapeFn(TransposeShapeFn);
+ 
++#ifdef INTEL_MKL
++REGISTER_OP("_MklConjugateTranspose")
++    .Input("x: T")
++    .Input("perm: Tperm")
++    .Output("y: T")
++    .Attr("T: type")
++    .Attr("Tperm: {int32, int64} = DT_INT32")
++    .SetShapeFn(TransposeShapeFn);
++#endif // INTEL_MKL
++
+ // --------------------------------------------------------------------------
+ REGISTER_OP("Unique")
+     .Input("x: T")
+diff --git a/tensorflow/core/ops/math_ops.cc b/tensorflow/core/ops/math_ops.cc
+index 3ff9bc0985..a447a6c4ca 100644
+--- a/tensorflow/core/ops/math_ops.cc
++++ b/tensorflow/core/ops/math_ops.cc
+@@ -124,39 +124,7 @@ REGISTER_OP("BatchMatMul")
+         "complex128}")
+     .Attr("adj_x: bool = false")
+     .Attr("adj_y: bool = false")
+-    .SetShapeFn([](InferenceContext* c) {
+-      ShapeHandle a_shape;
+-      ShapeHandle b_shape;
+-      TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(0), 2, &a_shape));
+-      TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(1), 2, &b_shape));
+-
+-      // Determine output rows and cols.
+-      bool adj_x;
+-      bool adj_y;
+-      TF_RETURN_IF_ERROR(c->GetAttr("adj_x", &adj_x));
+-      TF_RETURN_IF_ERROR(c->GetAttr("adj_y", &adj_y));
+-      DimensionHandle output_rows = c->Dim(a_shape, adj_x ? -1 : -2);
+-      DimensionHandle output_cols = c->Dim(b_shape, adj_y ? -2 : -1);
+-
+-      // Batch dims match between inputs.
+-      ShapeHandle a_batch_dims;
+-      ShapeHandle b_batch_dims;
+-      ShapeHandle batch_dims;
+-      TF_RETURN_IF_ERROR(c->Subshape(a_shape, 0, -2, &a_batch_dims));
+-      TF_RETURN_IF_ERROR(c->Subshape(b_shape, 0, -2, &b_batch_dims));
+-      TF_RETURN_IF_ERROR(c->Merge(a_batch_dims, b_batch_dims, &batch_dims));
+-
+-      // Assert inner dims match.
+-      DimensionHandle unused;
+-      TF_RETURN_IF_ERROR(c->Merge(c->Dim(a_shape, adj_x ? -2 : -1),
+-                                  c->Dim(b_shape, adj_y ? -1 : -2), &unused));
+-
+-      ShapeHandle out;
+-      TF_RETURN_IF_ERROR(c->Concatenate(
+-          batch_dims, c->Matrix(output_rows, output_cols), &out));
+-      c->set_output(0, out);
+-      return Status::OK();
+-    });
++    .SetShapeFn(shape_inference::BatchMatMulShape);
+ 
+ REGISTER_OP("BatchMatMulV2")
+     .Input("x: T")
+@@ -169,6 +137,17 @@ REGISTER_OP("BatchMatMulV2")
+     .Attr("adj_y: bool = false")
+     .SetShapeFn(shape_inference::BatchMatMulV2Shape);
+ 
++#ifdef INTEL_MKL
++REGISTER_OP("_MklBatchMatMul")
++    .Input("x: T")
++    .Input("y: T")
++    .Output("output: T")
++    .Attr("T: {bfloat16, half, float, double, int32, complex64, complex128}")
++    .Attr("adj_x: bool = false")
++    .Attr("adj_y: bool = false")
++    .SetShapeFn(shape_inference::BatchMatMulShape);
++#endif  // INTEL_MKL
++
+ // --------------------------------------------------------------------------
+ // Casting Ops
+ //
+@@ -892,6 +871,17 @@ REGISTER_OP("MatMul")
+         "complex128}")
+     .SetShapeFn(shape_inference::MatMulShape);
+ 
++#ifdef INTEL_MKL
++REGISTER_OP("_MklMatMul")
++    .Input("a: T")
++    .Input("b: T")
++    .Output("product: T")
++    .Attr("transpose_a: bool = false")
++    .Attr("transpose_b: bool = false")
++    .Attr("T: {float, double, complex64, complex128}")
++    .SetShapeFn(shape_inference::MatMulShape);
++#endif  // INTEL_MKL
++
+ REGISTER_OP("SparseMatMul")
+     .Input("a: Ta")
+     .Input("b: Tb")
+diff --git a/tensorflow/python/keras/engine/base_layer.py b/tensorflow/python/keras/engine/base_layer.py
+index 5c7457b63a..8e728f22bb 100644
+--- a/tensorflow/python/keras/engine/base_layer.py
++++ b/tensorflow/python/keras/engine/base_layer.py
+@@ -448,8 +448,9 @@ def from_config(cls, config):
+   def compute_output_shape(self, input_shape):
+     """Computes the output shape of the layer.
+ 
+-    Assumes that the layer will be built
+-    to match that input shape provided.
++    If the layer has not been built, this method will call `build` on the
++    layer. This assumes that the layer will later be used with inputs that
++    match the input shape provided here.
+ 
+     Arguments:
+         input_shape: Shape tuple (tuple of integers)
+@@ -465,9 +466,10 @@ def compute_output_shape(self, input_shape):
+       # This is acceptable because the framework only calls
+       # `compute_output_shape` on shape values that the layer would later be
+       # built for. It would however cause issues in case a user attempts to
+-      # use `compute_output_shape` manually (these users will have to
++      # use `compute_output_shape` manually with shapes that are incompatible
++      # with the shape the Layer will be called on (these users will have to
+       # implement `compute_output_shape` themselves).
+-      self.build(input_shape)
++      self._maybe_build(input_shape)
+       with context.graph_mode():
+         graph = func_graph.FuncGraph('graph')
+         with graph.as_default():
+diff --git a/tensorflow/python/keras/engine/base_layer_test.py b/tensorflow/python/keras/engine/base_layer_test.py
+index a57c159591..0c14b632cd 100644
+--- a/tensorflow/python/keras/engine/base_layer_test.py
++++ b/tensorflow/python/keras/engine/base_layer_test.py
+@@ -103,6 +103,27 @@ def test_dynamic_layer_error_running_in_graph_mode(self):
+           ValueError, 'You must enable eager execution'):
+         model.compile(rmsprop.RMSprop(0.001), loss='mse')
+ 
++  def test_manual_compute_output_shape(self):
++    class BuildCounter(keras.layers.Layer):
++
++      def __init__(self, *args, **kwargs):  # pylint: disable=redefined-outer-name
++        super(BuildCounter, self).__init__(*args, **kwargs)
++        self.build_counter = 0
++
++      def build(self, input_shape):
++        self.build_counter += 1
++
++      def call(self, inputs):
++        return inputs
++
++    with context.eager_mode():
++      layer = BuildCounter()
++      output_shape = layer.compute_output_shape((None, 10))
++      self.assertEqual(layer.build_counter, 1)
++      self.assertEqual(output_shape.as_list(), [None, 10])
++      layer(np.ones((5, 10)))
++      self.assertEqual(layer.build_counter, 1)
++
+   def test_dynamic_layer_with_deferred_sequential_model(self):
+     model = keras.Sequential(
+         [DynamicLayer(dynamic=True),
+
