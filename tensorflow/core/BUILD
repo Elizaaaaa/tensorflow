@@ -264,7 +264,7 @@ ADDITIONAL_CORE_PROTO_SRCS = [
 
 tf_proto_library(
     name = "protos_all",
-    srcs = [],
+    srcs = ["//tensorflow/core:protos_all_py"],
     cc_api_version = 2,
     make_default_target_header_only = True,
     protodeps = [
@@ -2474,6 +2474,7 @@ cc_library(
             "lib/gif/**/*",
             "lib/jpeg/**/*",
             "lib/png/**/*",
+            "platform/retrying_utils.cc"
         ],
     ) + [
         "//tensorflow/core/platform:legacy_monitoring_srcs",
@@ -2706,7 +2707,7 @@ cc_library(
 
 tf_proto_library(
     name = "error_codes_proto",
-    srcs = ERROR_CODES_PROTO_SRCS,
+    srcs = "//tensorflow/core:error_codes_proto_py",
     cc_api_version = 2,
     make_default_target_header_only = True,
     provide_cc_alias = True,
@@ -2714,7 +2715,7 @@ tf_proto_library(
 
 tf_generate_proto_text_sources(
     name = "error_codes_proto_text",
-    srcs = ERROR_CODES_PROTO_SRCS,
+    srcs = "//tensorflow/core:error_codes_proto_py",
     protodeps = [],
     srcs_relative_dir = "tensorflow/core/",
     deps = [
@@ -3662,10 +3663,10 @@ cc_library(
 cc_library(
     name = "retrying_utils",
     srcs = [
-        "platform/retrying_utils.cc",
+        "//tensorflow/core/platform:retrying_utils.cc",
     ],
     hdrs = [
-        "platform/retrying_utils.h",
+        "//tensorflow/core/platform:retrying_utils.h",
     ],
     copts = tf_copts(),
     deps = [
@@ -3677,7 +3678,7 @@ cc_library(
 cc_library(
     name = "retrying_file_system",
     hdrs = [
-        "platform/retrying_file_system.h",
+        "//tensorflow/core/platform:retrying_file_system.h",
     ],
     copts = tf_copts(),
     deps = [
@@ -5465,7 +5466,7 @@ tf_cc_tests(
 tf_cc_test(
     name = "retrying_file_system_test",
     size = "small",
-    srcs = ["platform/retrying_file_system_test.cc"],
+    srcs = ["//tensorflow/core/platform:retrying_file_system_test.cc"],
     deps = [
         ":retrying_file_system",
         "//tensorflow/core:lib",
@@ -5478,7 +5479,7 @@ tf_cc_test(
 tf_cc_test(
     name = "retrying_utils_test",
     size = "small",
-    srcs = ["platform/retrying_utils_test.cc"],
+    srcs = ["//tensorflow/core/platform:retrying_utils_test.cc"],
     deps = [
         "//tensorflow/core:retrying_utils",
         "//tensorflow/core:lib",
