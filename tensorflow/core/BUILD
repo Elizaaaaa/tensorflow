@@ -2475,6 +2475,15 @@ cc_library(
             "lib/jpeg/**/*",
             "lib/png/**/*",
             "platform/retrying_utils.cc"
+            "platform/**/env_time.cc",
+            "platform/**/monitoring.cc",
+            "platform/**/cuda_libdevice_path.cc",
+            "platform/**/device_tracer.cc",
+            "platform/**/logger.cc",
+            "platform/**/logging.cc",
+            "platform/**/human_readable_json.cc",
+            "platform/abi.cc",
+            "platform/protobuf.cc",
         ],
     ) + [
         "//tensorflow/core/platform:legacy_monitoring_srcs",
