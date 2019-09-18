@@ -1,0 +1,1337 @@
+From f31d840194005ae35410e4176e28eb89b8e5dd85 Mon Sep 17 00:00:00 2001
+From: Yutong Zhang <yutongzh@amazon.com>
+Date: Wed, 18 Sep 2019 14:36:13 -0700
+Subject: [PATCH] apply s3 changes
+
+---
+ tensorflow/core/BUILD                         |  54 +++++++
+ tensorflow/core/platform/cloud/BUILD          |  61 +-------
+ .../cloud/compute_engine_metadata_client.cc   |   1 +
+ .../cloud/compute_engine_metadata_client.h    |   2 +-
+ .../core/platform/cloud/gcs_file_system.cc    |   2 +-
+ .../core/platform/cloud/gcs_file_system.h     |   2 +-
+ .../platform/cloud/google_auth_provider.cc    |   2 +-
+ .../cloud/retrying_file_system_test.cc        |   2 +-
+ .../platform/cloud/retrying_utils_test.cc     |   2 +-
+ tensorflow/core/platform/default/logging.cc   |  17 +-
+ tensorflow/core/platform/default/logging.h    |   2 +
+ tensorflow/core/platform/env.cc               |   6 +
+ tensorflow/core/platform/env.h                |   9 ++
+ tensorflow/core/platform/file_system.cc       |   4 +
+ tensorflow/core/platform/file_system.h        |   8 +
+ tensorflow/core/platform/file_system_test.cc  |   6 +
+ .../{cloud => }/retrying_file_system.h        |   7 +-
+ .../platform/{cloud => }/retrying_utils.cc    |  17 +-
+ .../platform/{cloud => }/retrying_utils.h     |  10 +-
+ tensorflow/core/platform/s3/aws_crypto.cc     |  22 +++
+ tensorflow/core/platform/s3/aws_crypto.h      |   8 +
+ tensorflow/core/platform/s3/aws_logging.cc    |  38 +++--
+ tensorflow/core/platform/s3/s3_file_system.cc | 147 +++++++++++++++---
+ tensorflow/core/platform/s3/s3_file_system.h  |  32 +++-
+ .../core/platform/s3/s3_file_system_test.cc   |   6 +
+ .../core/util/tensor_bundle/tensor_bundle.cc  |  40 +++--
+ tensorflow/python/lib/io/file_io.i            |  14 ++
+ tensorflow/python/lib/io/file_io.py           |  47 +++++-
+ tensorflow/python/platform/gfile.py           |   1 +
+ tensorflow/python/training/saver.py           |   7 +-
+ .../api/golden/v1/tensorflow.gfile.pbtxt      |   4 +
+ .../api/golden/v2/tensorflow.io.gfile.pbtxt   |   4 +
+ third_party/aws/BUILD.bazel                   |   3 +
+ 33 files changed, 440 insertions(+), 147 deletions(-)
+ rename tensorflow/core/platform/{cloud => }/retrying_file_system.h (97%)
+ rename tensorflow/core/platform/{cloud => }/retrying_utils.cc (89%)
+ rename tensorflow/core/platform/{cloud => }/retrying_utils.h (88%)
+
+diff --git a/tensorflow/core/BUILD b/tensorflow/core/BUILD
+index 97b3db0526..d6de4ece99 100644
+--- a/tensorflow/core/BUILD
++++ b/tensorflow/core/BUILD
+@@ -3659,6 +3659,34 @@ cc_library(
+     alwayslink = 0,
+ )
+ 
++cc_library(
++    name = "retrying_utils",
++    srcs = [
++        "platform/retrying_utils.cc",
++    ],
++    hdrs = [
++        "platform/retrying_utils.h",
++    ],
++    copts = tf_copts(),
++    deps = [
++        "//tensorflow/core:framework_headers_lib",
++        "//tensorflow/core:lib_internal",
++    ],
++)
++
++cc_library(
++    name = "retrying_file_system",
++    hdrs = [
++        "platform/retrying_file_system.h",
++    ],
++    copts = tf_copts(),
++    deps = [
++        ":retrying_utils",
++        "//tensorflow/core:framework_headers_lib",
++        "//tensorflow/core:lib_internal",
++    ],
++)
++
+ # -----------------------------------------------------------------------------
+ # Tests
+ 
+@@ -5434,6 +5462,32 @@ tf_cc_tests(
+     ],
+ )
+ 
++tf_cc_test(
++    name = "retrying_file_system_test",
++    size = "small",
++    srcs = ["platform/retrying_file_system_test.cc"],
++    deps = [
++        ":retrying_file_system",
++        "//tensorflow/core:lib",
++        "//tensorflow/core:lib_internal",
++        "//tensorflow/core:test",
++        "//tensorflow/core:test_main",
++    ],
++)
++
++tf_cc_test(
++    name = "retrying_utils_test",
++    size = "small",
++    srcs = ["platform/retrying_utils_test.cc"],
++    deps = [
++        "//tensorflow/core:retrying_utils",
++        "//tensorflow/core:lib",
++        "//tensorflow/core:lib_internal",
++        "//tensorflow/core:test",
++        "//tensorflow/core:test_main",
++    ],
++)
++
+ # Test data
+ filegroup(
+     name = "image_testdata",
+diff --git a/tensorflow/core/platform/cloud/BUILD b/tensorflow/core/platform/cloud/BUILD
+index db1a0310fa..2b9ddc23b1 100644
+--- a/tensorflow/core/platform/cloud/BUILD
++++ b/tensorflow/core/platform/cloud/BUILD
+@@ -89,8 +89,8 @@ cc_library(
+         ":google_auth_provider",
+         ":http_request",
+         ":ram_file_block_cache",
+-        ":retrying_file_system",
+-        ":retrying_utils",
++        "//tensorflow/core:retrying_file_system",
++        "//tensorflow/core:retrying_utils",
+         ":time_util",
+         "//tensorflow/core:framework_headers_lib",
+         "//tensorflow/core:lib",
+@@ -150,7 +150,7 @@ cc_library(
+     deps = [
+         ":compute_engine_metadata_client",
+         ":oauth_client",
+-        ":retrying_utils",
++        "//tensorflow/core:retrying_utils",
+         "//tensorflow/core:lib",
+         "//tensorflow/core:lib_internal",
+         "@com_google_absl//absl/strings",
+@@ -170,7 +170,7 @@ cc_library(
+     deps = [
+         ":curl_http_request",
+         ":http_request",
+-        ":retrying_utils",
++        "//tensorflow/core:retrying_utils",
+         "//tensorflow/core:lib",
+         "//tensorflow/core:lib_internal",
+     ],
+@@ -223,34 +223,6 @@ cc_library(
+     ],
+ )
+ 
+-cc_library(
+-    name = "retrying_utils",
+-    srcs = [
+-        "retrying_utils.cc",
+-    ],
+-    hdrs = [
+-        "retrying_utils.h",
+-    ],
+-    copts = tf_copts(),
+-    deps = [
+-        "//tensorflow/core:framework_headers_lib",
+-        "//tensorflow/core:lib_internal",
+-    ],
+-)
+-
+-cc_library(
+-    name = "retrying_file_system",
+-    hdrs = [
+-        "retrying_file_system.h",
+-    ],
+-    copts = tf_copts(),
+-    deps = [
+-        ":retrying_utils",
+-        "//tensorflow/core:framework_headers_lib",
+-        "//tensorflow/core:lib_internal",
+-    ],
+-)
+-
+ cc_library(
+     name = "time_util",
+     srcs = [
+@@ -410,18 +382,6 @@ tf_cc_test(
+     ],
+ )
+ 
+-tf_cc_test(
+-    name = "retrying_file_system_test",
+-    size = "small",
+-    srcs = ["retrying_file_system_test.cc"],
+-    deps = [
+-        ":retrying_file_system",
+-        "//tensorflow/core:lib",
+-        "//tensorflow/core:lib_internal",
+-        "//tensorflow/core:test",
+-        "//tensorflow/core:test_main",
+-    ],
+-)
+ 
+ tf_cc_test(
+     name = "time_util_test",
+@@ -433,16 +393,3 @@ tf_cc_test(
+         "//tensorflow/core:test_main",
+     ],
+ )
+-
+-tf_cc_test(
+-    name = "retrying_utils_test",
+-    size = "small",
+-    srcs = ["retrying_utils_test.cc"],
+-    deps = [
+-        ":retrying_utils",
+-        "//tensorflow/core:lib",
+-        "//tensorflow/core:lib_internal",
+-        "//tensorflow/core:test",
+-        "//tensorflow/core:test_main",
+-    ],
+-)
+diff --git a/tensorflow/core/platform/cloud/compute_engine_metadata_client.cc b/tensorflow/core/platform/cloud/compute_engine_metadata_client.cc
+index affb68ebbb..e9f20b21a3 100644
+--- a/tensorflow/core/platform/cloud/compute_engine_metadata_client.cc
++++ b/tensorflow/core/platform/cloud/compute_engine_metadata_client.cc
+@@ -17,6 +17,7 @@ limitations under the License.
+ 
+ #include <utility>
+ #include "tensorflow/core/platform/cloud/curl_http_request.h"
++#include "tensorflow/core/platform/retrying_utils.h"
+ 
+ namespace tensorflow {
+ 
+diff --git a/tensorflow/core/platform/cloud/compute_engine_metadata_client.h b/tensorflow/core/platform/cloud/compute_engine_metadata_client.h
+index 7f060327da..ac03b05514 100644
+--- a/tensorflow/core/platform/cloud/compute_engine_metadata_client.h
++++ b/tensorflow/core/platform/cloud/compute_engine_metadata_client.h
+@@ -18,7 +18,7 @@ limitations under the License.
+ 
+ #include "tensorflow/core/lib/core/status.h"
+ #include "tensorflow/core/platform/cloud/http_request.h"
+-#include "tensorflow/core/platform/cloud/retrying_utils.h"
++#include "tensorflow/core/platform/retrying_utils.h"
+ 
+ namespace tensorflow {
+ 
+diff --git a/tensorflow/core/platform/cloud/gcs_file_system.cc b/tensorflow/core/platform/cloud/gcs_file_system.cc
+index 9110ee3a30..d3dbcde7c3 100644
+--- a/tensorflow/core/platform/cloud/gcs_file_system.cc
++++ b/tensorflow/core/platform/cloud/gcs_file_system.cc
+@@ -38,7 +38,7 @@ limitations under the License.
+ #include "tensorflow/core/platform/cloud/file_block_cache.h"
+ #include "tensorflow/core/platform/cloud/google_auth_provider.h"
+ #include "tensorflow/core/platform/cloud/ram_file_block_cache.h"
+-#include "tensorflow/core/platform/cloud/retrying_utils.h"
++#include "tensorflow/core/platform/retrying_utils.h"
+ #include "tensorflow/core/platform/cloud/time_util.h"
+ #include "tensorflow/core/platform/env.h"
+ #include "tensorflow/core/platform/mutex.h"
+diff --git a/tensorflow/core/platform/cloud/gcs_file_system.h b/tensorflow/core/platform/cloud/gcs_file_system.h
+index 16e4f18855..cb69709aeb 100644
+--- a/tensorflow/core/platform/cloud/gcs_file_system.h
++++ b/tensorflow/core/platform/cloud/gcs_file_system.h
+@@ -30,7 +30,7 @@ limitations under the License.
+ #include "tensorflow/core/platform/cloud/gcs_dns_cache.h"
+ #include "tensorflow/core/platform/cloud/gcs_throttle.h"
+ #include "tensorflow/core/platform/cloud/http_request.h"
+-#include "tensorflow/core/platform/cloud/retrying_file_system.h"
++#include "tensorflow/core/platform/retrying_file_system.h"
+ #include "tensorflow/core/platform/file_system.h"
+ 
+ namespace tensorflow {
+diff --git a/tensorflow/core/platform/cloud/google_auth_provider.cc b/tensorflow/core/platform/cloud/google_auth_provider.cc
+index e91a9f8975..ca76948099 100644
+--- a/tensorflow/core/platform/cloud/google_auth_provider.cc
++++ b/tensorflow/core/platform/cloud/google_auth_provider.cc
+@@ -27,7 +27,7 @@ limitations under the License.
+ #include "tensorflow/core/lib/core/errors.h"
+ #include "tensorflow/core/lib/io/path.h"
+ #include "tensorflow/core/lib/strings/base64.h"
+-#include "tensorflow/core/platform/cloud/retrying_utils.h"
++#include "tensorflow/core/platform/retrying_utils.h"
+ #include "tensorflow/core/platform/env.h"
+ 
+ namespace tensorflow {
+diff --git a/tensorflow/core/platform/cloud/retrying_file_system_test.cc b/tensorflow/core/platform/cloud/retrying_file_system_test.cc
+index 2b26f27f82..c5e56e1527 100644
+--- a/tensorflow/core/platform/cloud/retrying_file_system_test.cc
++++ b/tensorflow/core/platform/cloud/retrying_file_system_test.cc
+@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ ==============================================================================*/
+ 
+-#include "tensorflow/core/platform/cloud/retrying_file_system.h"
++#include "tensorflow/core/platform/retrying_file_system.h"
+ #include <fstream>
+ #include "tensorflow/core/lib/core/status_test_util.h"
+ #include "tensorflow/core/lib/strings/str_util.h"
+diff --git a/tensorflow/core/platform/cloud/retrying_utils_test.cc b/tensorflow/core/platform/cloud/retrying_utils_test.cc
+index 771bb44285..0eb57cfece 100644
+--- a/tensorflow/core/platform/cloud/retrying_utils_test.cc
++++ b/tensorflow/core/platform/cloud/retrying_utils_test.cc
+@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ ==============================================================================*/
+ 
+-#include "tensorflow/core/platform/cloud/retrying_utils.h"
++#include "tensorflow/core/platform/retrying_utils.h"
+ #include <fstream>
+ #include "tensorflow/core/lib/core/status_test_util.h"
+ #include "tensorflow/core/lib/strings/str_util.h"
+diff --git a/tensorflow/core/platform/default/logging.cc b/tensorflow/core/platform/default/logging.cc
+index 335c171f82..a7e15bfaeb 100644
+--- a/tensorflow/core/platform/default/logging.cc
++++ b/tensorflow/core/platform/default/logging.cc
+@@ -122,14 +122,6 @@ int ParseInteger(const char* str, size_t size) {
+   return level;
+ }
+ 
+-// Parse log level (int64) from environment variable (char*)
+-int64 LogLevelStrToInt(const char* tf_env_var_val) {
+-  if (tf_env_var_val == nullptr) {
+-    return 0;
+-  }
+-  return ParseInteger(tf_env_var_val, strlen(tf_env_var_val));
+-}
+-
+ // Using StringPiece breaks Windows build.
+ struct StringData {
+   struct Hasher {
+@@ -199,6 +191,15 @@ VmoduleMap* VmodulesMapFromEnv() {
+ 
+ }  // namespace
+ 
++// Parse log level (int64) from environment variable (char*)
++int64 LogLevelStrToInt(const char* tf_env_var_val) {
++  if (tf_env_var_val == nullptr) {
++    return 0;
++  }
++  return ParseInteger(tf_env_var_val, strlen(tf_env_var_val));
++}
++
++
+ int64 MinLogLevelFromEnv() {
+   // We don't want to print logs during fuzzing as that would slow fuzzing down
+   // by almost 2x. So, if we are in fuzzing mode (not just running a test), we
+diff --git a/tensorflow/core/platform/default/logging.h b/tensorflow/core/platform/default/logging.h
+index 9ca8b12286..276be70103 100644
+--- a/tensorflow/core/platform/default/logging.h
++++ b/tensorflow/core/platform/default/logging.h
+@@ -339,6 +339,8 @@ T&& CheckNotNull(const char* file, int line, const char* exprtext, T&& t) {
+   return std::forward<T>(t);
+ }
+ 
++int64 LogLevelStrToInt(const char* tf_env_var_val);
++
+ int64 MinLogLevelFromEnv();
+ 
+ int64 MinVLogLevelFromEnv();
+diff --git a/tensorflow/core/platform/env.cc b/tensorflow/core/platform/env.cc
+index 75e5b31f3f..025a7fac9d 100644
+--- a/tensorflow/core/platform/env.cc
++++ b/tensorflow/core/platform/env.cc
+@@ -258,6 +258,12 @@ Status Env::IsDirectory(const string& fname) {
+   return fs->IsDirectory(fname);
+ }
+ 
++Status Env::NeedsTempLocation(const string& path) {
++  FileSystem* fs;
++  TF_RETURN_IF_ERROR(GetFileSystemForFile(path, &fs));
++  return fs->NeedsTempLocation(path);
++}
++
+ Status Env::DeleteRecursively(const string& dirname, int64* undeleted_files,
+                               int64* undeleted_dirs) {
+   FileSystem* fs;
+diff --git a/tensorflow/core/platform/env.h b/tensorflow/core/platform/env.h
+index f7a91c7703..72cc3e97a5 100644
+--- a/tensorflow/core/platform/env.h
++++ b/tensorflow/core/platform/env.h
+@@ -226,6 +226,15 @@ class Env {
+   ///  * UNIMPLEMENTED - The file factory doesn't support directories.
+   Status IsDirectory(const string& fname);
+ 
++  /// \brief Returns whether the given path needs a temp location
++  /// to safely write objects.
++  /// Typical return codes (not guaranteed exhaustive):
++  ///  * OK - The path is on a file system that should use a temp location
++  ///         to safely write objects
++  ///  * FAILED_PRECONDITION - The path is on a file system that does not
++  ///            need a temp location
++  Status NeedsTempLocation(const string& path);
++
+   /// Stores the size of `fname` in `*file_size`.
+   Status GetFileSize(const string& fname, uint64* file_size);
+ 
+diff --git a/tensorflow/core/platform/file_system.cc b/tensorflow/core/platform/file_system.cc
+index 3ab542a5d8..c5ec69d117 100644
+--- a/tensorflow/core/platform/file_system.cc
++++ b/tensorflow/core/platform/file_system.cc
+@@ -47,6 +47,10 @@ Status FileSystem::IsDirectory(const string& name) {
+   return Status(tensorflow::error::FAILED_PRECONDITION, "Not a directory");
+ }
+ 
++Status FileSystem::NeedsTempLocation(const string& path) {
++  return Status::OK();
++}
++
+ void FileSystem::FlushCaches() {}
+ 
+ RandomAccessFile::~RandomAccessFile() {}
+diff --git a/tensorflow/core/platform/file_system.h b/tensorflow/core/platform/file_system.h
+index 21d9f3f097..a810337ea5 100644
+--- a/tensorflow/core/platform/file_system.h
++++ b/tensorflow/core/platform/file_system.h
+@@ -221,6 +221,14 @@ class FileSystem {
+   ///  * UNIMPLEMENTED - The file factory doesn't support directories.
+   virtual Status IsDirectory(const string& fname);
+ 
++  /// \brief Returns whether the given path needs a temp location to write
++  /// safely
++  ///
++  /// Typical return codes (not guaranteed exhaustive):
++  ///  * OK - Needs a temp location
++  ///  * FAILED_PRECONDITION - Does not need a temp location
++  virtual Status NeedsTempLocation(const string& path);
++
+   /// \brief Flushes any cached filesystem objects from memory.
+   virtual void FlushCaches();
+ 
+diff --git a/tensorflow/core/platform/file_system_test.cc b/tensorflow/core/platform/file_system_test.cc
+index a931634a3c..85270e1ede 100644
+--- a/tensorflow/core/platform/file_system_test.cc
++++ b/tensorflow/core/platform/file_system_test.cc
+@@ -261,6 +261,12 @@ TEST(InterPlanetaryFileSystemTest, RecursivelyCreateAlreadyExistingDir) {
+   TF_EXPECT_OK(ipfs.RecursivelyCreateDir(dirname));
+ }
+ 
++TEST(InterPlanetaryFileSystemTest, NeedsTempLocation) {
++  InterPlanetaryFileSystem ipfs;
++  const string dirname = io::JoinPath(kPrefix, "match-00/abc/00");
++  TF_EXPECT_OK(ipfs.NeedsTempLocation(dirname));
++}
++
+ // A simple file system with a root directory and a single file underneath it.
+ class TestFileSystem : public NullFileSystem {
+  public:
+diff --git a/tensorflow/core/platform/cloud/retrying_file_system.h b/tensorflow/core/platform/retrying_file_system.h
+similarity index 97%
+rename from tensorflow/core/platform/cloud/retrying_file_system.h
+rename to tensorflow/core/platform/retrying_file_system.h
+index 9659edd890..92dcd73d67 100644
+--- a/tensorflow/core/platform/cloud/retrying_file_system.h
++++ b/tensorflow/core/platform/retrying_file_system.h
+@@ -23,7 +23,7 @@ limitations under the License.
+ #include "tensorflow/core/lib/core/errors.h"
+ #include "tensorflow/core/lib/core/status.h"
+ #include "tensorflow/core/lib/random/random.h"
+-#include "tensorflow/core/platform/cloud/retrying_utils.h"
++#include "tensorflow/core/platform/retrying_utils.h"
+ #include "tensorflow/core/platform/env.h"
+ #include "tensorflow/core/platform/file_system.h"
+ 
+@@ -121,6 +121,11 @@ class RetryingFileSystem : public FileSystem {
+         retry_config_);
+   }
+ 
++  Status NeedsTempLocation(const string& path) override {
++    // this does not need to be retried
++    return base_file_system_->NeedsTempLocation(path);
++  }
++
+   Status DeleteRecursively(const string& dirname, int64* undeleted_files,
+                            int64* undeleted_dirs) override {
+     return RetryingUtils::DeleteWithRetries(
+diff --git a/tensorflow/core/platform/cloud/retrying_utils.cc b/tensorflow/core/platform/retrying_utils.cc
+similarity index 89%
+rename from tensorflow/core/platform/cloud/retrying_utils.cc
+rename to tensorflow/core/platform/retrying_utils.cc
+index 9c963dd82f..93dd0d9697 100644
+--- a/tensorflow/core/platform/cloud/retrying_utils.cc
++++ b/tensorflow/core/platform/retrying_utils.cc
+@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ ==============================================================================*/
+ 
+-#include "tensorflow/core/platform/cloud/retrying_utils.h"
++#include "tensorflow/core/platform/retrying_utils.h"
+ #include "tensorflow/core/lib/core/errors.h"
+ #include "tensorflow/core/lib/random/random.h"
+ #include "tensorflow/core/platform/env.h"
+@@ -23,16 +23,9 @@ namespace tensorflow {
+ 
+ namespace {
+ 
+-bool IsRetriable(error::Code code) {
+-  switch (code) {
+-    case error::UNAVAILABLE:
+-    case error::DEADLINE_EXCEEDED:
+-    case error::UNKNOWN:
+-      return true;
+-    default:
+-      // OK also falls here.
+-      return false;
+-  }
++bool IsRetriable(const std::set<error::Code> retriable_errors,
++                 const error::Code code) {
++  return retriable_errors.find(code) != retriable_errors.end();
+ }
+ 
+ }  // namespace
+@@ -51,7 +44,7 @@ Status RetryingUtils::CallWithRetries(
+   int retries = 0;
+   while (true) {
+     auto status = f();
+-    if (!IsRetriable(status.code())) {
++    if (!IsRetriable(config.retriable_errors, status.code())) {
+       return status;
+     }
+     if (retries >= config.max_retries) {
+diff --git a/tensorflow/core/platform/cloud/retrying_utils.h b/tensorflow/core/platform/retrying_utils.h
+similarity index 88%
+rename from tensorflow/core/platform/cloud/retrying_utils.h
+rename to tensorflow/core/platform/retrying_utils.h
+index 1a7ce1b122..589db1bd3e 100644
+--- a/tensorflow/core/platform/cloud/retrying_utils.h
++++ b/tensorflow/core/platform/retrying_utils.h
+@@ -18,6 +18,7 @@ limitations under the License.
+ 
+ #include <functional>
+ #include "tensorflow/core/lib/core/status.h"
++#include "tensorflow/core/lib/core/errors.h"
+ 
+ namespace tensorflow {
+ 
+@@ -25,10 +26,14 @@ namespace tensorflow {
+ struct RetryConfig {
+   RetryConfig(int64 init_delay_time_us = 100 * 1000,
+               int64 max_delay_time_us = 32 * 1000 * 1000,
+-              int max_retries = 10) {
++              int max_retries = 10,
++              std::set<error::Code> retriable_errors = {error::UNAVAILABLE, 
++                error::DEADLINE_EXCEEDED,
++                error::UNKNOWN}) {
+     this->init_delay_time_us = init_delay_time_us;
+     this->max_delay_time_us = max_delay_time_us;
+     this->max_retries = max_retries;
++    this->retriable_errors = retriable_errors;
+   }
+ 
+   // In case of failure, every call will be retried max_retries times.
+@@ -39,6 +44,9 @@ struct RetryConfig {
+ 
+   // Maximum backoff time in microseconds.
+   int64 max_delay_time_us;
++
++  // Set of errors which need to be retried
++  std::set<error::Code> retriable_errors;
+ };
+ 
+ class RetryingUtils {
+diff --git a/tensorflow/core/platform/s3/aws_crypto.cc b/tensorflow/core/platform/s3/aws_crypto.cc
+index 90e46d6c1d..47ceeeec29 100644
+--- a/tensorflow/core/platform/s3/aws_crypto.cc
++++ b/tensorflow/core/platform/s3/aws_crypto.cc
+@@ -15,6 +15,7 @@ limitations under the License.
+ #include "tensorflow/core/platform/s3/aws_crypto.h"
+ #include <openssl/hmac.h>
+ #include <openssl/sha.h>
++#include <openssl/rand.h>
+ 
+ #include <aws/core/utils/crypto/HashResult.h>
+ #include <aws/s3/S3Client.h>
+@@ -100,6 +101,22 @@ class AWSSha256OpenSSLImpl : public Aws::Utils::Crypto::Hash {
+   }
+ };
+ 
++class AWSSecureRandomBytesImpl : public Aws::Utils::Crypto::SecureRandomBytes {
++ public:
++  AWSSecureRandomBytesImpl() {}
++  virtual ~AWSSecureRandomBytesImpl() = default;
++  virtual void GetBytes(unsigned char* buffer, size_t bufferSize) override {
++    assert(buffer);
++    int success = RAND_bytes(buffer, static_cast<int>(bufferSize));
++    if (success != 1) {
++      m_failure = true;
++    }
++  }
++
++ private:
++  bool m_failure;
++};
++
+ std::shared_ptr<Aws::Utils::Crypto::Hash>
+ AWSSHA256Factory::CreateImplementation() const {
+   return Aws::MakeShared<AWSSha256OpenSSLImpl>(AWSCryptoAllocationTag);
+@@ -110,4 +127,9 @@ AWSSHA256HmacFactory::CreateImplementation() const {
+   return Aws::MakeShared<AWSSha256HMACOpenSSLImpl>(AWSCryptoAllocationTag);
+ }
+ 
++std::shared_ptr<Aws::Utils::Crypto::SecureRandomBytes>
++AWSSecureRandomFactory::CreateImplementation() const {
++  return Aws::MakeShared<AWSSecureRandomBytesImpl>(AWSCryptoAllocationTag);
++}
++
+ }  // namespace tensorflow
+diff --git a/tensorflow/core/platform/s3/aws_crypto.h b/tensorflow/core/platform/s3/aws_crypto.h
+index f05771b904..433a5d5a9f 100644
+--- a/tensorflow/core/platform/s3/aws_crypto.h
++++ b/tensorflow/core/platform/s3/aws_crypto.h
+@@ -16,6 +16,7 @@ limitations under the License.
+ #include <aws/core/utils/crypto/Factories.h>
+ #include <aws/core/utils/crypto/HMAC.h>
+ #include <aws/core/utils/crypto/Hash.h>
++#include <aws/core/utils/crypto/SecureRandom.h>
+ 
+ namespace tensorflow {
+ static const char* AWSCryptoAllocationTag = "AWSCryptoAllocation";
+@@ -32,4 +33,11 @@ class AWSSHA256HmacFactory : public Aws::Utils::Crypto::HMACFactory {
+       const override;
+ };
+ 
++class AWSSecureRandomFactory : public Aws::Utils::Crypto::SecureRandomFactory {
++ public:
++  std::shared_ptr<Aws::Utils::Crypto::SecureRandomBytes> CreateImplementation()
++      const override;
++};
++
++
+ }  // namespace tensorflow
+diff --git a/tensorflow/core/platform/s3/aws_logging.cc b/tensorflow/core/platform/s3/aws_logging.cc
+index dac5690889..57abefba7c 100644
+--- a/tensorflow/core/platform/s3/aws_logging.cc
++++ b/tensorflow/core/platform/s3/aws_logging.cc
+@@ -63,7 +63,7 @@ void AWSLogSystem::LogMessage(Aws::Utils::Logging::LogLevel log_level,
+       LOG(FATAL) << message;
+       break;
+     default:
+-      LOG(ERROR) << message;
++      LOG(INFO) << message;
+       break;
+   }
+ }
+@@ -92,26 +92,40 @@ static const char* kAWSLoggingTag = "AWSLogging";
+ Aws::Utils::Logging::LogLevel ParseLogLevelFromEnv() {
+   Aws::Utils::Logging::LogLevel log_level = Aws::Utils::Logging::LogLevel::Info;
+ 
+-  const int64_t level = getenv("AWS_LOG_LEVEL")
+-                            ? LogLevelStrToInt(getenv("AWS_LOG_LEVEL"))
+-                            : tensorflow::internal::MinLogLevelFromEnv();
++  const char* aws_sdk_log = std::getenv("TF_S3_LOG_LEVEL");
++  int64_t level;
++  if (aws_sdk_log == nullptr) {
++    // default logging level of FATAL
++    level = 1;
++  } else {
++    level = tensorflow::internal::LogLevelStrToInt(aws_sdk_log);
++  }
+ 
+   switch (level) {
+-    case INFO:
+-      log_level = Aws::Utils::Logging::LogLevel::Info;
++    case 0:
++      log_level = Aws::Utils::Logging::LogLevel::Off;
+       break;
+-    case WARNING:
+-      log_level = Aws::Utils::Logging::LogLevel::Warn;
++    case 1:
++      log_level = Aws::Utils::Logging::LogLevel::Fatal;
+       break;
+-    case ERROR:
++    case 2:
+       log_level = Aws::Utils::Logging::LogLevel::Error;
+       break;
+-    case FATAL:
+-      log_level = Aws::Utils::Logging::LogLevel::Fatal;
++    case 3:
++      log_level = Aws::Utils::Logging::LogLevel::Warn;
+       break;
+-    default:
++    case 4:
+       log_level = Aws::Utils::Logging::LogLevel::Info;
+       break;
++    case 5:
++      log_level = Aws::Utils::Logging::LogLevel::Debug;
++      break;
++    case 6:
++      log_level = Aws::Utils::Logging::LogLevel::Trace;
++      break;
++    default:
++      log_level = Aws::Utils::Logging::LogLevel::Fatal;
++      break;
+   }
+ 
+   return log_level;
+diff --git a/tensorflow/core/platform/s3/s3_file_system.cc b/tensorflow/core/platform/s3/s3_file_system.cc
+index 50cbb23a7a..56de5476d4 100644
+--- a/tensorflow/core/platform/s3/s3_file_system.cc
++++ b/tensorflow/core/platform/s3/s3_file_system.cc
+@@ -26,6 +26,7 @@ limitations under the License.
+ #include <aws/core/utils/StringUtils.h>
+ #include <aws/core/utils/logging/AWSLogging.h>
+ #include <aws/core/utils/logging/LogSystemInterface.h>
++#include <aws/core/utils/threading/Executor.h>
+ #include <aws/s3/S3Client.h>
+ #include <aws/s3/S3Errors.h>
+ #include <aws/s3/model/CopyObjectRequest.h>
+@@ -35,8 +36,11 @@ limitations under the License.
+ #include <aws/s3/model/HeadObjectRequest.h>
+ #include <aws/s3/model/ListObjectsRequest.h>
+ #include <aws/s3/model/PutObjectRequest.h>
++#include <aws/transfer/TransferManager.h>
+ 
+ #include <cstdlib>
++#include <mutex>
++#include <thread>
+ 
+ namespace tensorflow {
+ 
+@@ -44,6 +48,9 @@ namespace {
+ static const char* kS3FileSystemAllocationTag = "S3FileSystemAllocation";
+ static const size_t kS3ReadAppendableFileBufferSize = 1024 * 1024;
+ static const int kS3GetChildrenMaxKeys = 100;
++static const int kExecutorPoolSize = 5;
++static const int kUploadRetries = 5;
++static const char* kExecutorTag = "TransferManagerExecutor";
+ 
+ Aws::Client::ClientConfiguration& GetDefaultClientConfig() {
+   static mutex cfg_lock(LINKER_INITIALIZED);
+@@ -124,6 +131,15 @@ Aws::Client::ClientConfiguration& GetDefaultClientConfig() {
+       }
+     }
+ 
++    const char* ca_file = getenv("S3_CA_FILE");
++    if (ca_file) {
++      cfg.caFile = Aws::String(ca_file);
++    }
++    const char* ca_path = getenv("S3_CA_PATH");
++    if (ca_path) {
++      cfg.caPath = Aws::String(ca_path);
++    }
++
+     init = true;
+   }
+ 
+@@ -139,6 +155,18 @@ void ShutdownClient(Aws::S3::S3Client* s3_client) {
+   }
+ }
+ 
++void ShutdownTransferManager(Aws::Transfer::TransferManager* transfer_manager) {
++  if (transfer_manager != nullptr) {
++    delete transfer_manager;
++  }
++}
++
++void ShutdownExecutor(Aws::Utils::Threading::PooledThreadExecutor* executor) {
++  if (executor != nullptr) {
++    delete executor;
++  }
++}
++
+ Status ParseS3Path(const string& fname, bool empty_object_ok, string* bucket,
+                    string* object) {
+   if (!bucket || !object) {
+@@ -176,6 +204,7 @@ class S3RandomAccessFile : public RandomAccessFile {
+ 
+   Status Read(uint64 offset, size_t n, StringPiece* result,
+               char* scratch) const override {
++    VLOG(1) << "ReadFilefromS3 s3://" << bucket_ << "/" << object_;
+     Aws::S3::Model::GetObjectRequest getObjectRequest;
+     getObjectRequest.WithBucket(bucket_.c_str()).WithKey(object_.c_str());
+     string bytes = strings::StrCat("bytes=", offset, "-", offset + n - 1);
+@@ -185,9 +214,13 @@ class S3RandomAccessFile : public RandomAccessFile {
+     });
+     auto getObjectOutcome = this->s3_client_->GetObject(getObjectRequest);
+     if (!getObjectOutcome.IsSuccess()) {
+-      n = 0;
+-      *result = StringPiece(scratch, n);
+-      return Status(error::OUT_OF_RANGE, "Read less bytes than requested");
++      auto error = getObjectOutcome.GetError();
++      if (error.GetResponseCode() == Aws::Http::HttpResponseCode::REQUESTED_RANGE_NOT_SATISFIABLE) {
++        n = 0;
++        *result = StringPiece(scratch, n);
++        return Status(error::OUT_OF_RANGE, "Read less bytes than requested");
++      } else {
++        return errors::Unknown(error.GetExceptionName(), error.GetMessage());
+     }
+     n = getObjectOutcome.GetResult().GetContentLength();
+     getObjectOutcome.GetResult().GetBody().read(scratch, n);
+@@ -202,16 +235,22 @@ class S3RandomAccessFile : public RandomAccessFile {
+   std::shared_ptr<Aws::S3::S3Client> s3_client_;
+ };
+ 
++static int tmp_file_index_;
++static std::mutex tmp_file_suffix_lock_;
++
+ class S3WritableFile : public WritableFile {
+  public:
+-  S3WritableFile(const string& bucket, const string& object,
+-                 std::shared_ptr<Aws::S3::S3Client> s3_client)
++  S3WritableFile(
++    const string& bucket, const string& object,
++    std::shared_ptr<Aws::Transfer::TransferManager> transfer_manager,
++    std::shared_ptr<Aws::S3::S3Client> s3_client)
+       : bucket_(bucket),
+         object_(object),
++        transfer_manager_(transfer_manager),
+         s3_client_(s3_client),
+         sync_needed_(true),
+         outfile_(Aws::MakeShared<Aws::Utils::TempFile>(
+-            kS3FileSystemAllocationTag, "/tmp/s3_filesystem_XXXXXX",
++            kS3FileSystemAllocationTag, GetTmpFileSuffix().c_str(),
+             std::ios_base::binary | std::ios_base::trunc | std::ios_base::in |
+                 std::ios_base::out)) {}
+ 
+@@ -251,28 +290,53 @@ class S3WritableFile : public WritableFile {
+     if (!sync_needed_) {
+       return Status::OK();
+     }
+-    Aws::S3::Model::PutObjectRequest putObjectRequest;
+-    putObjectRequest.WithBucket(bucket_.c_str()).WithKey(object_.c_str());
++    VLOG(1) << "WriteFileToS3: s3://" << bucket_ << "/" << object_;
+     long offset = outfile_->tellp();
+-    outfile_->seekg(0);
+-    putObjectRequest.SetBody(outfile_);
+-    putObjectRequest.SetContentLength(offset);
+-    auto putObjectOutcome = this->s3_client_->PutObject(putObjectRequest);
++    std::shared_ptr<Aws::Transfer::TransferHandle> handle = 
++      transfer_manager_.get()->UploadFile(
++        outfile_, bucket_.c_str(), object_.c_str(),
++        "application/octet-stream", Aws::Map<Aws::String, Aws::String>());
++    handle->WaitUntilFinished();
++    int retries = 0;
++    while (handle->GetStatus() == Aws::Transfer::TransferStatus::FAILED &&
++           retries++ < kUploadRetries) {
++      // if multipart upload was used, only the failed parts will be re-sent
++      VLOG(1) << "Retrying Upload of s3://" << bucket_ << "/" << object_
++              << " after failure. Current retry count:" << retries;
++      transfer_manager_.get()->RetryUpload(outfile_, handle);
++      handle->WaitUntilFinished();
++    }
++    if (handle->GetStatus() != Aws::Transfer::TransferStatus::COMPLETED) {
++      return errors::Unknown(handle->GetLastError().GetExceptionName(), ": ",
++                             handle->GetFailedParts().size(), " failed parts. ",
++                             handle->GetLastError().GetMessage());
++    }
+     outfile_->clear();
+     outfile_->seekp(offset);
+-    if (!putObjectOutcome.IsSuccess()) {
+-      return errors::Unknown(putObjectOutcome.GetError().GetExceptionName(),
+-                             ": ", putObjectOutcome.GetError().GetMessage());
+-    }
++
+     return Status::OK();
+   }
+ 
+  private:
+   string bucket_;
+   string object_;
+-  std::shared_ptr<Aws::S3::S3Client> s3_client_;
+   bool sync_needed_;
+   std::shared_ptr<Aws::Utils::TempFile> outfile_;
++  std::shared_ptr<Aws::S3::S3Client> s3_client_;
++  std::shared_ptr<Aws::Transfer::TransferManager> transfer_manager_;
++
++  std::string GetTmpFileSuffix() {
++    const int max_tmp_file_index = 1000;
++    int tmp_file_index;
++    {
++      std::lock_guard<std::mutex> lock(tmp_file_suffix_lock_);
++      tmp_file_index = tmp_file_index_;
++      tmp_file_index_ = (tmp_file_index_ + 1) % max_tmp_file_index;
++    }
++    std::ostringstream tmp_file_suffix;
++    tmp_file_suffix << "/tmp/s3_filesystem_XXXXXX" << tmp_file_index << "_";
++    return tmp_file_suffix.str();
++  }
+ };
+ 
+ class S3ReadOnlyMemoryRegion : public ReadOnlyMemoryRegion {
+@@ -290,13 +354,16 @@ class S3ReadOnlyMemoryRegion : public ReadOnlyMemoryRegion {
+ }  // namespace
+ 
+ S3FileSystem::S3FileSystem()
+-    : s3_client_(nullptr, ShutdownClient), client_lock_() {}
++    : s3_client_(nullptr, ShutdownClient), 
++    initialization_lock_(),
++    transfer_manager_(nullptr, ShutdownTransferManager),
++    executor_(nullptr, ShutdownExecutor) {}
+ 
+ S3FileSystem::~S3FileSystem() {}
+ 
+ // Initializes s3_client_, if needed, and returns it.
+ std::shared_ptr<Aws::S3::S3Client> S3FileSystem::GetS3Client() {
+-  std::lock_guard<mutex> lock(this->client_lock_);
++  std::lock_guard<mutex> lock(this->initialization_lock_);
+ 
+   if (this->s3_client_.get() == nullptr) {
+     AWSLogSystem::InitializeAWSLogging();
+@@ -308,6 +375,9 @@ std::shared_ptr<Aws::S3::S3Client> S3FileSystem::GetS3Client() {
+     options.cryptoOptions.sha256HMACFactory_create_fn = []() {
+       return Aws::MakeShared<AWSSHA256HmacFactory>(AWSCryptoAllocationTag);
+     };
++    options.cryptoOptions.secureRandomFactory_create_fn = []() {
++      return Aws::MakeShared<AWSSecureRandomFactory>(AWSCryptoAllocationTag);
++    };
+     Aws::InitAPI(options);
+ 
+     // The creation of S3Client disables virtual addressing:
+@@ -324,6 +394,29 @@ std::shared_ptr<Aws::S3::S3Client> S3FileSystem::GetS3Client() {
+   return this->s3_client_;
+ }
+ 
++std::shared_ptr<Aws::Transfer::TransferManager>
++S3FileSystem::GetTransferManager() {
++  std::shared_ptr<Aws::S3::S3Client> s3_client = this->GetS3Client();
++  std::lock_guard<mutex> lock(this->initialization_lock_);
++  if (this->transfer_manager_.get() == nullptr) {
++    Aws::Transfer::TransferManagerConfiguration config(
++        this->GetExecutor().get());
++    config.s3Client = s3_client;
++    this->transfer_manager_ = Aws::Transfer::TransferManager::Create(config);
++  }
++  return this->transfer_manager_;
++}
++
++std::shared_ptr<Aws::Utils::Threading::PooledThreadExecutor>
++S3FileSystem::GetExecutor() {
++  if (this->executor_.get() == nullptr) {
++    this->executor_ =
++        Aws::MakeShared<Aws::Utils::Threading::PooledThreadExecutor>(
++            kExecutorTag, kExecutorPoolSize);
++  }
++  return this->executor_;
++}
++
+ Status S3FileSystem::NewRandomAccessFile(
+     const string& fname, std::unique_ptr<RandomAccessFile>* result) {
+   string bucket, object;
+@@ -336,7 +429,8 @@ Status S3FileSystem::NewWritableFile(const string& fname,
+                                      std::unique_ptr<WritableFile>* result) {
+   string bucket, object;
+   TF_RETURN_IF_ERROR(ParseS3Path(fname, false, &bucket, &object));
+-  result->reset(new S3WritableFile(bucket, object, this->GetS3Client()));
++  result->reset(new S3WritableFile(bucket, object, this->GetTransferManager(),
++                                    this->GetS3Client()));
+   return Status::OK();
+ }
+ 
+@@ -485,9 +579,11 @@ Status S3FileSystem::Stat(const string& fname, FileStatistics* stats) {
+   auto listObjectsOutcome =
+       this->GetS3Client()->ListObjects(listObjectsRequest);
+   if (listObjectsOutcome.IsSuccess()) {
+-    if (listObjectsOutcome.GetResult().GetContents().size() > 0) {
++    auto listObjects = listObjectsOutcome.GetResult().GetContents();
++    if (listObjects.size() > 0) {
+       stats->length = 0;
+       stats->is_directory = 1;
++      stats->mtime_nsec = listObjects[0].GetLastModified().Millis() * 1e6;
+       found = true;
+     }
+   }
+@@ -535,13 +631,16 @@ Status S3FileSystem::CreateDir(const string& dirname) {
+   if (filename.back() != '/') {
+     filename.push_back('/');
+   }
+-  std::unique_ptr<WritableFile> file;
+-  TF_RETURN_IF_ERROR(NewWritableFile(filename, &file));
+-  TF_RETURN_IF_ERROR(file->Close());
++  if (!this->FileExists(filename).ok()) {
++    std::unique_ptr<WritableFile> file;
++    TF_RETURN_IF_ERROR(NewWritableFile(filename, &file));
++    TF_RETURN_IF_ERROR(file->Close());
++  }
+   return Status::OK();
+ }
+ 
+ Status S3FileSystem::DeleteDir(const string& dirname) {
++  VLOG(1) << "DeleteDir: " << dirname;
+   string bucket, object;
+   TF_RETURN_IF_ERROR(ParseS3Path(dirname, false, &bucket, &object));
+ 
+diff --git a/tensorflow/core/platform/s3/s3_file_system.h b/tensorflow/core/platform/s3/s3_file_system.h
+index 5d0565b378..14c9e88d8b 100644
+--- a/tensorflow/core/platform/s3/s3_file_system.h
++++ b/tensorflow/core/platform/s3/s3_file_system.h
+@@ -17,8 +17,11 @@ limitations under the License.
+ #define TENSORFLOW_CONTRIB_S3_S3_FILE_SYSTEM_H_
+ 
+ #include <aws/s3/S3Client.h>
++#include <aws/transfer/TransferManager.h>
+ #include "tensorflow/core/platform/env.h"
+ #include "tensorflow/core/platform/mutex.h"
++#include "tensorflow/core/platform/retrying_file_system.h"
++
+ 
+ namespace tensorflow {
+ 
+@@ -59,6 +62,9 @@ class S3FileSystem : public FileSystem {
+ 
+   Status RenameFile(const string& src, const string& target) override;
+ 
++  virtual Status NeedsTempLocation(const string& path) override;
++
++
+  private:
+   // Returns the member S3 client, initializing as-needed.
+   // When the client tries to access the object in S3, e.g.,
+@@ -75,9 +81,29 @@ class S3FileSystem : public FileSystem {
+   // for a bucket.
+   std::shared_ptr<Aws::S3::S3Client> GetS3Client();
+ 
+-  std::shared_ptr<Aws::S3::S3Client> s3_client_;
+-  // Lock held when checking for s3_client_ initialization.
+-  mutex client_lock_;
++  // Returns the member transfer manager, initializing as-needed.
++  std::shared_ptr<Aws::Transfer::TransferManager> GetTransferManager();
++  std::shared_ptr<Aws::Transfer::TransferManager> transfer_manager_;
++
++  // Returns the member executor for transfer manager, initializing as-needed.
++  std::shared_ptr<Aws::Utils::Threading::PooledThreadExecutor> GetExecutor();
++  std::shared_ptr<Aws::Utils::Threading::PooledThreadExecutor> executor_;
++
++  // Lock held when checking for s3_client_ and transfer_manager_ initialization
++  mutex initialization_lock_;
++};
++
++/// S3 implementation of a file system with retry on failures.
++class RetryingS3FileSystem : public RetryingFileSystem<S3FileSystem> {
++ public:
++  RetryingS3FileSystem()
++      : RetryingFileSystem(
++            std::unique_ptr<S3FileSystem>(new S3FileSystem),
++            RetryConfig(
++                100000 /* init_delay_time_us */,
++                32000000 /* max_delay_time_us */, 10 /* max_retries */,
++                {error::UNAVAILABLE, error::DEADLINE_EXCEEDED, error::UNKNOWN,
++                 error::FAILED_PRECONDITION, error::INTERNAL})) {}
+ };
+ 
+ }  // namespace tensorflow
+diff --git a/tensorflow/core/platform/s3/s3_file_system_test.cc b/tensorflow/core/platform/s3/s3_file_system_test.cc
+index d4411d9865..b3612c32ed 100644
+--- a/tensorflow/core/platform/s3/s3_file_system_test.cc
++++ b/tensorflow/core/platform/s3/s3_file_system_test.cc
+@@ -231,5 +231,11 @@ TEST_F(S3FileSystemTest, StatFile) {
+   EXPECT_FALSE(stat.is_directory);
+ }
+ 
++TEST_F(S3FileSystemTest, NeedsTempLocation) {
++  const string fname = TmpDir("NeedsTempLocation");
++  TF_ASSERT_OK(WriteString(fname, "test"));
++  EXPECT_EQ(error::Code::FAILED_PRECONDITION, s3fs.NeedsTempLocation(fname).code());
++}
++
+ }  // namespace
+ }  // namespace tensorflow
+diff --git a/tensorflow/core/util/tensor_bundle/tensor_bundle.cc b/tensorflow/core/util/tensor_bundle/tensor_bundle.cc
+index 0756b47f22..71edbe89c4 100644
+--- a/tensorflow/core/util/tensor_bundle/tensor_bundle.cc
++++ b/tensorflow/core/util/tensor_bundle/tensor_bundle.cc
+@@ -42,6 +42,7 @@ limitations under the License.
+ #include "tensorflow/core/lib/io/table_builder.h"
+ #include "tensorflow/core/lib/random/random.h"
+ #include "tensorflow/core/lib/strings/stringprintf.h"
++#include "tensorflow/core/lib/strings/str_util.h"
+ #include "tensorflow/core/util/saved_tensor_slice_util.h"
+ #include "tensorflow/core/util/tensor_bundle/byte_swap.h"
+ #include "tensorflow/core/util/tensor_slice_util.h"
+@@ -402,24 +403,29 @@ BundleWriter::BundleWriter(Env* env, StringPiece prefix, const Options& options)
+     : env_(env),
+       options_(options),
+       prefix_(prefix),
+-      tmp_metadata_path_(strings::StrCat(MetaFilename(prefix_), ".tempstate",
+-                                         random::New64())),
+-      tmp_data_path_(strings::StrCat(DataFilename(prefix_, 0, 1), ".tempstate",
+-                                     random::New64())),
+       out_(nullptr),
+       size_(0) {
++  data_path_ = DataFilename(prefix_, 0, 1);
++  metadata_path_ = MetaFilename(prefix_);
++  use_temp_file_ = env_->NeedsTempLocation(prefix_).ok();
++  if (use_temp_file_) {
++    data_path_ = strings::StrCat(data_path_, ".tempstate", random::New64());
++    metadata_path_ =
++      strings::StrCat(metadata_path_, ".tempstate", random::New64());
++  }
++
+   status_ = env_->CreateDir(string(io::Dirname(prefix_)));
+   if (!status_.ok() && !errors::IsAlreadyExists(status_)) {
+     return;
+   }
+-  const string filename = DataFilename(prefix_, 0, 1);
++
+   std::unique_ptr<WritableFile> wrapper;
+-  status_ = env_->NewWritableFile(tmp_data_path_, &wrapper);
++
+   if (!status_.ok()) return;
+   out_ = std::unique_ptr<FileOutputBuffer>(
+       new FileOutputBuffer(wrapper.release(), 8 << 20 /* 8MB write buffer */));
+ 
+-  VLOG(1) << "Writing to file " << tmp_data_path_;
++  VLOG(1) << "Writing to file " << data_path_;
+ }
+ 
+ Status BundleWriter::Add(StringPiece key, const Tensor& val) {
+@@ -507,16 +513,18 @@ Status BundleWriter::Finish() {
+     status_.Update(out_->Close());
+     out_ = nullptr;
+     if (status_.ok()) {
+-      status_ = Env::Default()->RenameFile(tmp_data_path_,
+-                                           DataFilename(prefix_, 0, 1));
++      if (use_temp_file_) {
++        status_ =
++          Env::Default()->RenameFile(data_path_, DataFilename(prefix_, 0, 1));
++      }
+     } else {
+-      Env::Default()->DeleteFile(tmp_data_path_).IgnoreError();
++      Env::Default()->DeleteFile(data_path_).IgnoreError();
+     }
+   }
+   if (!status_.ok()) return status_;
+   // Build key -> BundleEntryProto table.
+   std::unique_ptr<WritableFile> file;
+-  status_ = env_->NewWritableFile(tmp_metadata_path_, &file);
++  status_ = env_->NewWritableFile(metadata_path_, &file);
+   if (!status_.ok()) return status_;
+   {
+     // N.B.: the default use of Snappy compression may not be supported on all
+@@ -543,12 +551,14 @@ Status BundleWriter::Finish() {
+   }
+   status_.Update(file->Close());
+   if (!status_.ok()) {
+-    Env::Default()->DeleteFile(tmp_metadata_path_).IgnoreError();
++    Env::Default()->DeleteFile(metadata_path_).IgnoreError();
+     return status_;
+   } else {
+-    status_ =
+-        Env::Default()->RenameFile(tmp_metadata_path_, MetaFilename(prefix_));
+-    if (!status_.ok()) return status_;
++    if (use_temp_file_) {
++      status_ = 
++        Env::Default()->RenameFile(metadata_path_, MetaFilename(prefix_));
++      if (!status_.ok()) return status_;
++    }
+   }
+   status_ = errors::Internal("BundleWriter is closed");
+   return Status::OK();
+diff --git a/tensorflow/python/lib/io/file_io.i b/tensorflow/python/lib/io/file_io.i
+index fa56159e27..a435df8b88 100644
+--- a/tensorflow/python/lib/io/file_io.i
++++ b/tensorflow/python/lib/io/file_io.i
+@@ -163,6 +163,19 @@ bool IsDirectory(const string& dirname, TF_Status* out_status) {
+   return false;
+ }
+ 
++bool NeedsTempLocation(const string& path, TF_Status* out_status) {
++  tensorflow::Status status = tensorflow::Env::Default()->NeedsTempLocation(path);
++  if (status.ok()) {
++    return true;
++  }
++  // FAILED_PRECONDITION Status response means that writing to the path
++  // does not need a temp location
++  if (status.code() != tensorflow::error::FAILED_PRECONDITION) {
++    Set_TF_Status_from_Status(out_status, status);
++  }
++  return false;
++}
++
+ using tensorflow::FileStatistics;
+ 
+ void Stat(const string& filename, FileStatistics* stats, TF_Status* status) {
+@@ -261,6 +274,7 @@ void RenameFile(const string& oldname, const string& newname, bool overwrite,
+                 TF_Status* status);
+ void DeleteRecursively(const string& dirname, TF_Status* status);
+ bool IsDirectory(const string& dirname, TF_Status* out_status);
++bool NeedsTempLocation(const string& path, TF_Status* out_status);
+ void Stat(const string& filename, tensorflow::FileStatistics* stats,
+           TF_Status* status);
+ tensorflow::io::BufferedInputStream* CreateBufferedInputStream(
+diff --git a/tensorflow/python/lib/io/file_io.py b/tensorflow/python/lib/io/file_io.py
+index 9ac66af221..25bd2df333 100644
+--- a/tensorflow/python/lib/io/file_io.py
++++ b/tensorflow/python/lib/io/file_io.py
+@@ -518,6 +518,36 @@ def rename_v2(src, dst, overwrite=False):
+   pywrap_tensorflow.RenameFile(
+       compat.as_bytes(src), compat.as_bytes(dst), overwrite)
+ 
++@tf_export(v1=["gfile.NeedsTempLocation"])
++def needs_temp_location(path):
++  """ Returns whether or not writing to the given path needs to use
++      a temporary location for safety
++  Args:
++    path: string, path to a file
++  Returns:
++    True, if the path is on a file system that needs to use a temporary
++          location to write safely. In such cases it is recommended to write to
++          a temporary location and then do (atomic) move to the final location.
++    False, if it is safe to write to the path without a temp location
++  """
++  return needs_temp_location_v2(path)
++
++@tf_export("io.gfile.needstemp")
++def needs_temp_location_v2(path):
++  """ Returns whether or not writing to the given path needs to use
++      a temporary location for safety
++  Args:
++    path: string, path to a file
++    
++  Returns:
++    True, if the path is on a file system that needs to use a temporary
++          location to write safely. In such cases it is recommended to write to
++          a temporary location and then do (atomic) move to the final location.
++    False, if it is safe to write to the path without a temp location
++  """
++  status = c_api_util.ScopedTFStatus()
++  return pywrap_tensorflow.NeedsTempLocation(compat.as_bytes(path), status)
++
+ 
+ def atomic_write_string_to_file(filename, contents, overwrite=True):
+   """Writes to `filename` atomically.
+@@ -534,13 +564,16 @@ def atomic_write_string_to_file(filename, contents, overwrite=True):
+     overwrite: boolean, if false it's an error for `filename` to be occupied by
+       an existing file.
+   """
+-  temp_pathname = filename + ".tmp" + uuid.uuid4().hex
+-  write_string_to_file(temp_pathname, contents)
+-  try:
+-    rename(temp_pathname, filename, overwrite)
+-  except errors.OpError:
+-    delete_file(temp_pathname)
+-    raise
++  if not needs_temp_location(filename):
++    write_string_to_file(filename, contents)
++  else:
++    temp_pathname = filename + ".tmp" + uuid.uuid4().hex
++    write_string_to_file(temp_pathname, contents)
++    try:
++      rename(temp_pathname, filename, overwrite)
++    except errors.OpError:
++      delete_file(temp_pathname)
++      raise
+ 
+ 
+ @tf_export(v1=["gfile.DeleteRecursively"])
+diff --git a/tensorflow/python/platform/gfile.py b/tensorflow/python/platform/gfile.py
+index dd2c615e9e..df307d09ea 100644
+--- a/tensorflow/python/platform/gfile.py
++++ b/tensorflow/python/platform/gfile.py
+@@ -27,6 +27,7 @@ from tensorflow.python.lib.io.file_io import file_exists as Exists
+ from tensorflow.python.lib.io.file_io import FileIO as _FileIO
+ from tensorflow.python.lib.io.file_io import get_matching_files as Glob
+ from tensorflow.python.lib.io.file_io import is_directory as IsDirectory
++from tensorflow.python.lib.io.file_io import needs_temp_location as NeedsTempLocation
+ from tensorflow.python.lib.io.file_io import list_directory as ListDirectory
+ from tensorflow.python.lib.io.file_io import recursive_create_dir as MakeDirs
+ from tensorflow.python.lib.io.file_io import rename as Rename
+diff --git a/tensorflow/python/training/saver.py b/tensorflow/python/training/saver.py
+index d65297fb30..e5619a8074 100644
+--- a/tensorflow/python/training/saver.py
++++ b/tensorflow/python/training/saver.py
+@@ -38,12 +38,15 @@ from tensorflow.python.eager import context
+ from tensorflow.python.framework import constant_op
+ from tensorflow.python.framework import device as pydev
+ from tensorflow.python.framework import errors
++from tensorflow.python.framework import dtypes
+ from tensorflow.python.framework import meta_graph
+ from tensorflow.python.framework import ops
+ from tensorflow.python.ops import array_ops
+ from tensorflow.python.ops import control_flow_ops
+ from tensorflow.python.ops import gen_io_ops
+ from tensorflow.python.ops import io_ops
++from tensorflow.python.ops import resource_variable_ops
++from tensorflow.python.ops import state_ops
+ from tensorflow.python.ops import string_ops
+ from tensorflow.python.ops import variables
+ from tensorflow.python.platform import gfile
+@@ -247,7 +250,9 @@ class BaseSaverBuilder(object):
+     # prefix directly, instead of any physical pathname.  (On failure and
+     # subsequent restore, an outdated and orphaned temporary directory can be
+     # safely removed.)
+-    _SHARDED_SUFFIX = "_temp_%s/part" % uuid.uuid4().hex
++    _SHARDED_SUFFIX = control_flow_ops.cond(string_ops.regex_full_match(checkpoint_prefix, '^s3://.*'),
++                                            lambda: ".part",
++                                            lambda: "_temp_%s/part" % uuid.uuid4().hex)
+     tmp_checkpoint_prefix = string_ops.string_join(
+         [checkpoint_prefix, _SHARDED_SUFFIX])
+ 
+diff --git a/tensorflow/tools/api/golden/v1/tensorflow.gfile.pbtxt b/tensorflow/tools/api/golden/v1/tensorflow.gfile.pbtxt
+index 65b55a8b7c..9f42dfb284 100644
+--- a/tensorflow/tools/api/golden/v1/tensorflow.gfile.pbtxt
++++ b/tensorflow/tools/api/golden/v1/tensorflow.gfile.pbtxt
+@@ -60,4 +60,8 @@ tf_module {
+     name: "Walk"
+     argspec: "args=[\'top\', \'in_order\'], varargs=None, keywords=None, defaults=[\'True\'], "
+   }
++  member_method {
++    name: "NeedsTempLocation"
++    argspec: "args=[\'path\'], varargs=None, keywords=None, defaults=None"
++  }
+ }
+diff --git a/tensorflow/tools/api/golden/v2/tensorflow.io.gfile.pbtxt b/tensorflow/tools/api/golden/v2/tensorflow.io.gfile.pbtxt
+index a797c06ff3..0d7b093cd4 100644
+--- a/tensorflow/tools/api/golden/v2/tensorflow.io.gfile.pbtxt
++++ b/tensorflow/tools/api/golden/v2/tensorflow.io.gfile.pbtxt
+@@ -52,4 +52,8 @@ tf_module {
+     name: "walk"
+     argspec: "args=[\'top\', \'topdown\', \'onerror\'], varargs=None, keywords=None, defaults=[\'True\', \'None\'], "
+   }
++  member_method {
++    name: "needstemp"
++    argspec: "args=[\'path\'], varargs=None, keywords=None, defaults=None"
++  }
+ }
+diff --git a/third_party/aws/BUILD.bazel b/third_party/aws/BUILD.bazel
+index 36f7ca2fd3..26fbbf8790 100644
+--- a/third_party/aws/BUILD.bazel
++++ b/third_party/aws/BUILD.bazel
+@@ -56,6 +56,8 @@ cc_library(
+         "aws-cpp-sdk-kinesis/source/**/*.cpp",
+         "aws-cpp-sdk-s3/include/**/*.h",
+         "aws-cpp-sdk-s3/source/**/*.cpp",
++        "aws-cpp-sdk-transfer/include/**/*.h",
++        "aws-cpp-sdk-transfer/source/**/*.cpp",
+     ]),
+     hdrs = [
+         "aws-cpp-sdk-core/include/aws/core/SDKConfig.h",
+@@ -92,6 +94,7 @@ cc_library(
+         "aws-cpp-sdk-core/include/",
+         "aws-cpp-sdk-kinesis/include/",
+         "aws-cpp-sdk-s3/include/",
++        "aws-cpp-sdk-transfer/include/",
+     ],
+     deps = [
+         "@curl",
+-- 
+2.23.0
+
