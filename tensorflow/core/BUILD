@@ -2474,6 +2474,7 @@ cc_library(
             "lib/gif/**/*",
             "lib/jpeg/**/*",
             "lib/png/**/*",
+            "//tensorflow/core/platform:retrying_utils"
         ],
     ) + [
         "//tensorflow/core/platform:legacy_monitoring_srcs",
