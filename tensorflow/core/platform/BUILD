@@ -125,10 +125,10 @@ cc_library(
 cc_library(
     name = "retrying_utils",
     srcs = [
-        "platform/retrying_utils.cc",
+        "retrying_utils.cc",
     ],
     hdrs = [
-        "platform/retrying_utils.h",
+        "retrying_utils.h",
     ],
     copts = tf_copts(),
     deps = [
@@ -140,7 +140,7 @@ cc_library(
 cc_library(
     name = "retrying_file_system",
     hdrs = [
-        "platform/retrying_file_system.h",
+        "retrying_file_system.h",
     ],
     copts = tf_copts(),
     deps = [
@@ -153,7 +153,7 @@ cc_library(
 tf_cc_test(
     name = "retrying_file_system_test",
     size = "small",
-    srcs = ["platform/retrying_file_system_test.cc"],
+    srcs = ["retrying_file_system_test.cc"],
     deps = [
         ":retrying_file_system",
         "//tensorflow/core:lib",
@@ -166,7 +166,7 @@ tf_cc_test(
 tf_cc_test(
     name = "retrying_utils_test",
     size = "small",
-    srcs = ["platform/retrying_utils_test.cc"],
+    srcs = ["retrying_utils_test.cc"],
     deps = [
         "//tensorflow/core:retrying_utils",
         "//tensorflow/core:lib",
