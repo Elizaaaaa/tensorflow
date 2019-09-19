@@ -298,6 +298,7 @@ filegroup(
             "cpu_info.cc",
             "platform_strings.cc",
             "protobuf.cc",
+            "retrying_utils.cc"
         ],
     ),
     visibility = ["//tensorflow/core:__pkg__"],
