@@ -26,6 +26,7 @@ load(
 load(
     "//tensorflow:tensorflow.bzl",
     "tf_copts",
+    "tf_cc_test",
 )
 
 package(
