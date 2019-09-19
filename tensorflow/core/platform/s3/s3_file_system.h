@@ -80,7 +80,7 @@ class S3FileSystem : public FileSystem {
   // This S3 Client does not support Virtual Hosted–Style Method
   // for a bucket.
   std::shared_ptr<Aws::S3::S3Client> GetS3Client();
-
+  std::shared_ptr<Aws::S3::S3Client> s3_client_;
   // Returns the member transfer manager, initializing as-needed.
   std::shared_ptr<Aws::Transfer::TransferManager> GetTransferManager();
   std::shared_ptr<Aws::Transfer::TransferManager> transfer_manager_;
