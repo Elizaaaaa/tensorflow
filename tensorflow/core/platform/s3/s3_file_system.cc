@@ -685,6 +685,7 @@ Status S3FileSystem::GetFileSize(const string& fname, uint64* file_size) {
 }
 
 Status S3FileSystem::RenameFile(const string& src, const string& target) {
+  VLOG(1) << "RenameFile from: " << src << " to: " << target;
   string src_bucket, src_object, target_bucket, target_object;
   TF_RETURN_IF_ERROR(ParseS3Path(src, false, &src_bucket, &src_object));
   TF_RETURN_IF_ERROR(
@@ -754,6 +755,11 @@ Status S3FileSystem::RenameFile(const string& src, const string& target) {
   return Status::OK();
 }
 
-REGISTER_FILE_SYSTEM("s3", S3FileSystem);
+Status S3FileSystem::NeedsTempLocation(const string& path) {
+  return Status(tensorflow::error::FAILED_PRECONDITION,
+                "Does not need a temp location");
+}
+
+REGISTER_FILE_SYSTEM("s3", RetryingS3FileSystem);
 
 }  // namespace tensorflow
