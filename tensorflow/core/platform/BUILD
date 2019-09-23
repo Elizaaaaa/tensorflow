@@ -29,6 +29,7 @@ load(
 load(
     "//tensorflow:tensorflow.bzl",
     "tf_copts",
+    "tf_cc_test",
 )
 
 package(
@@ -124,7 +125,7 @@ cc_library(
 
 cc_library(
     name = "logging",
-    srcs = tf_platform_hdrs(["logging.h"]) + tf_platform_srcs(["logging.cc"]),
+    srcs = tf_platform_hdrs(["logging.h"])  tf_platform_srcs(["logging.cc"]),
     hdrs = ["logging.h"],
     deps = [
         ":env_time",
@@ -132,7 +133,7 @@ cc_library(
         ":platform",
         ":types",
         "//tensorflow/core/platform/default/build_config:base",
-    ] + tf_logging_absl_deps(),
+    ]  tf_logging_absl_deps(),
 )
 
 cc_library(
@@ -142,12 +143,12 @@ cc_library(
 
 cc_library(
     name = "rocm_rocdl_path",
-    srcs = ["rocm_rocdl_path.cc"] + tf_additional_rocdl_srcs(),
+    srcs = ["rocm_rocdl_path.cc"]  tf_additional_rocdl_srcs(),
     hdrs = ["rocm_rocdl_path.h"],
     deps = [
         ":types",
         "//tensorflow/core:lib",
-    ] + tf_additional_rocdl_deps(),
+    ]  tf_additional_rocdl_deps(),
 )
 
 cc_library(
@@ -180,7 +181,7 @@ cc_library(
     deps = [
         ":platform",
         ":types",
-    ] + tf_protobuf_deps(),
+    ]  tf_protobuf_deps(),
 )
 
 cc_library(
@@ -268,6 +269,60 @@ cc_library(
         ":platform",
         ":tstring",
         "//tensorflow/core/platform/default/build_config:base",
+    ],
+)
+
+cc_library(
+    name = "retrying_utils",
+    srcs = [
+        "retrying_utils.cc",
+    ],
+    hdrs = [
+        "retrying_utils.h",
+    ],
+    copts = tf_copts(),
+    deps = [
+        "//tensorflow/core:framework_headers_lib",
+        "//tensorflow/core:lib_internal",
+    ],
+)
+
+cc_library(
+    name = "retrying_file_system",
+    hdrs = [
+        "retrying_file_system.h",
+    ],
+    copts = tf_copts(),
+    deps = [
+        ":retrying_utils",
+        "//tensorflow/core:framework_headers_lib",
+        "//tensorflow/core:lib_internal",
+    ],
+)
+
+tf_cc_test(
+    name = "retrying_file_system_test",
+    size = "small",
+    srcs = ["retrying_file_system_test.cc"],
+    deps = [
+        ":retrying_file_system",
+        "//tensorflow/core:lib",
+        "//tensorflow/core:lib_internal",
+        "//tensorflow/core:test",
+        "//tensorflow/core:test_main",
+    ],
+)
+
+tf_cc_test(
+    name = "retrying_utils_test",
+    size = "small",
+    srcs = ["retrying_utils_test.cc"],
+    deps = [
+        "//tensorflow/core:retrying_utils",
+        "//tensorflow/core:lib",
+        "//tensorflow/core:lib_internal",
+        "//tensorflow/core:test",
+        "//tensorflow/core:test_main",
     ],
 )
 
@@ -404,6 +459,7 @@ filegroup(
             "protobuf.cc",
             "stringprintf.cc",
             "str_util.cc",
+            "retrying_utils.cc"
         ],
     ),
     visibility = ["//tensorflow/core:__pkg__"],
@@ -446,7 +502,7 @@ filegroup(
         "dynamic_annotations.h",
         "thread_annotations.h",
         "mutex.h",
-    ]) + tf_platform_srcs([
+    ])  tf_platform_srcs([
         "port.cc",
     ]),
     visibility = ["//tensorflow/core:__pkg__"],
@@ -457,7 +513,7 @@ filegroup(
     srcs = tf_platform_srcs([
         "env.cc",
         "load_library.cc",
-    ]) + tf_platform_hdrs([
+    ])  tf_platform_hdrs([
         "wide_char.h",
     ]),
     visibility = ["//tensorflow/core:__pkg__"],
@@ -477,7 +533,7 @@ filegroup(
         "subprocess.cc",
         "net.cc",
         "tracing.cc",
-    ]) + tf_platform_hdrs([
+    ])  tf_platform_hdrs([
         "tracing.h",
         "error.h",
         "context.h",
