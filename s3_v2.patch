@@ -10,48 +10,7 @@ index ca9ed7ac79..a1e8dfad8b 100644
  )
  
  package(
-@@ -124,7 +125,7 @@ cc_library(
- 
- cc_library(
-     name = "logging",
--    srcs = tf_platform_hdrs(["logging.h"]) + tf_platform_srcs(["logging.cc"]),
-+    srcs = tf_platform_hdrs(["logging.h"])  tf_platform_srcs(["logging.cc"]),
-     hdrs = ["logging.h"],
-     deps = [
-         ":env_time",
-@@ -132,7 +133,7 @@ cc_library(
-         ":platform",
-         ":types",
-         "//tensorflow/core/platform/default/build_config:base",
--    ] + tf_logging_absl_deps(),
-+    ]  tf_logging_absl_deps(),
- )
- 
- cc_library(
-@@ -142,12 +143,12 @@ cc_library(
- 
- cc_library(
-     name = "rocm_rocdl_path",
--    srcs = ["rocm_rocdl_path.cc"] + tf_additional_rocdl_srcs(),
-+    srcs = ["rocm_rocdl_path.cc"]  tf_additional_rocdl_srcs(),
-     hdrs = ["rocm_rocdl_path.h"],
-     deps = [
-         ":types",
-         "//tensorflow/core:lib",
--    ] + tf_additional_rocdl_deps(),
-+    ]  tf_additional_rocdl_deps(),
- )
- 
- cc_library(
-@@ -180,7 +181,7 @@ cc_library(
-     deps = [
-         ":platform",
-         ":types",
--    ] + tf_protobuf_deps(),
-+    ]  tf_protobuf_deps(),
- )
- 
- cc_library(
+
 @@ -271,6 +272,60 @@ cc_library(
      ],
  )
@@ -121,33 +80,7 @@ index ca9ed7ac79..a1e8dfad8b 100644
          ],
      ),
      visibility = ["//tensorflow/core:__pkg__"],
-@@ -446,7 +502,7 @@ filegroup(
-         "dynamic_annotations.h",
-         "thread_annotations.h",
-         "mutex.h",
--    ]) + tf_platform_srcs([
-+    ])  tf_platform_srcs([
-         "port.cc",
-     ]),
-     visibility = ["//tensorflow/core:__pkg__"],
-@@ -457,7 +513,7 @@ filegroup(
-     srcs = tf_platform_srcs([
-         "env.cc",
-         "load_library.cc",
--    ]) + tf_platform_hdrs([
-+    ])  tf_platform_hdrs([
-         "wide_char.h",
-     ]),
-     visibility = ["//tensorflow/core:__pkg__"],
-@@ -477,7 +533,7 @@ filegroup(
-         "subprocess.cc",
-         "net.cc",
-         "tracing.cc",
--    ]) + tf_platform_hdrs([
-+    ])  tf_platform_hdrs([
-         "tracing.h",
-         "error.h",
-         "context.h",
+
 diff --git a/tensorflow/core/platform/cloud/BUILD b/tensorflow/core/platform/cloud/BUILD
 index db1a0310fa..914c40c1c5 100644
 --- a/tensorflow/core/platform/cloud/BUILD
