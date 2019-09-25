@@ -51,6 +51,7 @@ RUN /install/install_bootstrap_deb_packages.sh
 RUN /install/install_deb_packages.sh
 RUN /install/install_clang.sh
 RUN /install/install_bazel.sh
+RUN /install/install_auditwheel.sh
 
 # Install python 3.6.
 RUN add-apt-repository ppa:jonathonf/python-3.6 && \
