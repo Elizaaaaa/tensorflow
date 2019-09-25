@@ -48,7 +48,6 @@ RUN /install/install_bootstrap_deb_packages.sh
 RUN /install/install_deb_packages.sh
 RUN /install/install_clang.sh
 RUN /install/install_bazel.sh
-RUN /install/install_auditwheel.sh
 
 # Install golang.
 RUN /install/install_golang.sh
@@ -64,6 +63,7 @@ RUN add-apt-repository ppa:jonathonf/python-3.6 && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.6 0
 
 RUN /install/install_pip_packages.sh
+RUN /install/install_auditwheel.sh
 
 # TODO(klimek): Figure out a better way to get the right include paths
 # forwarded when we install new packages.
@@ -72,3 +72,4 @@ RUN ln -s "/usr/include/x86_64-linux-gnu/python2.7" "/dt8/usr/include/x86_64-lin
 
 RUN ln -s "/usr/include/x86_64-linux-gnu/python3.6m" "/dt7/usr/include/x86_64-linux-gnu/python3.6m"
 RUN ln -s "/usr/include/x86_64-linux-gnu/python3.6m" "/dt8/usr/include/x86_64-linux-gnu/python3.6m"
+
