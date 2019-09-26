@@ -1,0 +1,85 @@
+# -*-perl-*-
+
+package.AWS-Tensorflow = {
+    interfaces = (1.0);
+
+    deploy = {
+        generic = true;
+    };
+
+    build-environment = {
+        chroot = basic;
+        network-access = blocked;
+    };
+
+    # Use NoOpBuild. See https://w.amazon.com/index.php/BrazilBuildSystem/NoOpBuild
+    build-system = brazilpython;
+    build-tools = {
+        1.0 = {
+            BrazilPath = 1.1;
+            BrazilPython = 2.0;
+            Python-setuptools = 18.x;
+            Python27 = 1.0;
+            Fabric = 1.10.x;
+            #CoralPythonBuildTool = 1.0;
+        };
+    };
+
+    # Use runtime-dependencies for when you want to bring in additional
+    # packages when deploying.
+    # Use dependencies instead if you intend for these dependencies to
+    # be exported to other packages that build against you.
+    dependencies = {
+        1.0 = {
+            Boto = 2.x;
+            Boto3 = 1.x;
+            OdinLocalPythonInterface = 1.1;
+            Paramiko = 2.4.x;
+            Python-Pycrypto = 2.6;
+            Fabric = 1.10.x;
+        };
+    };
+
+    runtime-dependencies = {
+        1.0 = {
+            Python27 = 1.0;
+            AmazonCACerts = 1.0;
+            BrazilPythonRunpy = 1.0_Python27;
+        };
+    };
+
+    resolves-conflict-dependencies = {
+        1.0 = {
+              OdinLocalPythonInterface = 1.1;
+             Paramiko = 2.4.x;
+              #Python-Mock = 2.0.x;
+        };
+    };
+
+     python = {
+          default-version = "2.7";
+          setup-type = setuptools;
+          #unittesttype = pytest;
+          # this test line must be modified by adding --cov
+          # YOUR_PYTHON_MODULE and uncommented in order to enable
+          # coverage.  You really, really should create tests.
+          #
+          # You must specify the python module or package root you wish to
+          # cover using the --cov command line flag. As an example, "--cov
+          # bender.core" would collect coverage for every module and
+          # package in the bender.core namespace.
+
+          #testargs_release = "--cov-report html --cov-report xml -v";
+          #testargs = "--cov-report term-missing";
+          #doctool = sphinx;
+      };
+      
+    targets = {
+          # see setup.py for the actual build logic
+          #         # keep this line for brazil-path to work
+          python = { type = python; };
+
+
+    };
+};
+

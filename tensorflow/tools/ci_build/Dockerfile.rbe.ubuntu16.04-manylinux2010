@@ -71,5 +71,3 @@ RUN ln -s "/usr/include/x86_64-linux-gnu/python2.7" "/dt8/usr/include/x86_64-lin
 
 RUN ln -s "/usr/include/x86_64-linux-gnu/python3.6m" "/dt7/usr/include/x86_64-linux-gnu/python3.6m"
 RUN ln -s "/usr/include/x86_64-linux-gnu/python3.6m" "/dt8/usr/include/x86_64-linux-gnu/python3.6m"
-
-RUN /install/install_auditwheel.sh
