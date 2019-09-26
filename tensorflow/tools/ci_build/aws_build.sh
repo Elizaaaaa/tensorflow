@@ -39,6 +39,13 @@ OS_TYPE="UBUNTU"
 TF_PYTHON_VERSION="$1"
 shift 1
 TF_BUILD_FLAGS="--copt=-msse4.1 --copt=-msse4.2 --copt=-mavx2 --copt=-mavx --copt=-mfma --cxxopt=-D_GLIBCXX_USE_CXX11_ABI=0 --copt=-DEIGEN_USE_VML --crosstool_top=//third_party/toolchains/preconfig/ubuntu16.04/gcc7_manylinux2010:toolchain"
+
+if [[ "${CONTAINER_TYPE}" == gpu* ]]; then
+  TF_BUILD_FLAGS="--config=cuda ${TF_BUILD_FLAGS}"
+fi
+
+echo "tf flags: ${TF_BUILD_FLAGS}"
+
 TF_TEST_FLAGS="''"
 TF_TEST_FILTER_TAGS="''"
 TF_TEST_TARGETS="''"
