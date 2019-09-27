@@ -40,6 +40,7 @@ TF_BUILD_FLAGS="--verbose_failures --copt=-msse4.1 --copt=-msse4.2 --copt=-mavx2
 if [[ "${CONTAINER_TYPE}" == gpu* ]]; then
   TF_BUILD_FLAGS="--config=cuda ${TF_BUILD_FLAGS}"
 fi
+
 echo "tf flags: ${TF_BUILD_FLAGS}"
 TF_TEST_FLAGS="''"
 TF_TEST_FILTER_TAGS="''"
