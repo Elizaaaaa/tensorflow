@@ -17,7 +17,6 @@ mode = "gpu" if args.gpu else "cpu"
 
 def build_tensorflow(hostname, os_type):
     run("git clone -b r" + args.version + " http://github.com/tensorflow/tensorflow.git tensorflow")
-    put("./bin/prepare_" + os_type + ".sh", "/home/" + hostname + "/tensorflow")
     os.system('zip -r tf.zip . -x "*test-runtime/*" "*build/*" "*.git/*"')
     put("tf.zip", "/home/" + hostname + "/tensorflow")
 
@@ -47,10 +46,11 @@ def build_tensorflow(hostname, os_type):
         
         utils.remote_aws_configure()
 
-        run("aws s3 sync s3://tensorflow-aws-beta/{version}/Ubuntu/estimator/ estimator-binaries".format(version=args.version, os_type=os_type))
+        run("aws s3 sync s3://tensorflow-aws-beta/{version}/Ubuntu/estimator/ estimator-binaries".format(version=args.version))
         run('source activate python{python_version} &&  pip install estimator-binaries/*.whl --user --upgrade'.format(python_version=args.python_version))
 
         build_options = '././tensorflow/tools/ci_build/aws_build.sh ' + build_mode + python_version + docker_image + command + build_mode + ' -c opt ' + extra_command
+        
         print("Building with command:\n{0}".format(build_options))
 
         run(build_options)
@@ -61,7 +61,9 @@ def build_tensorflow(hostname, os_type):
     with cd("/tmp/tensorflow_pkg"):
         utils.remote_aws_configure()
         try:
-            run("aws s3 cp . s3://tensorflow-aws-beta/" + args.version +  "/" + os_type + "/" + mode + "/" + "latest-patch-" + utils.PATCH + "/ --recursive --include '*'")
+            #One binary works for both AmazonLinux and Ubuntu
+            run("aws s3 cp . s3://tensorflow-aws-beta/" + args.version +  "/" + 'AmazonLinux' + "/" + mode + "/" + "latest-patch-" + utils.PATCH + "/ --recursive --include '*'")
+            run("aws s3 cp . s3://tensorflow-aws-beta/" + args.version +  "/" + 'Ubuntu' + "/" + mode + "/" + "latest-patch-" + utils.PATCH + "/ --recursive --include '*'")
         except Exception as e:
             raise Exception("Cannot copy files to s3 bucket " + str(e))
 
