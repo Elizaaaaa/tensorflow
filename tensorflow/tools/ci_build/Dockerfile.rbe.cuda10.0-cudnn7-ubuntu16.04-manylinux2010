@@ -8,7 +8,7 @@
 #  --tag "gcr.io/tensorflow-testing/nosla-cuda10.0-cudnn7-ubuntu16.04-manylinux2010" .
 # $ docker push gcr.io/tensorflow-testing/nosla-cuda10.0-cudnn7-ubuntu16.04-manylinux2010
 
-FROM nvidia/cuda:10.0-cudnn7-devel-ubuntu16.04 as devtoolset
+FROM cudnntest:latest as devtoolset
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
@@ -33,7 +33,8 @@ RUN /build_devtoolset.sh devtoolset-7 /dt7
 RUN /build_devtoolset.sh devtoolset-8 /dt8
 
 # TODO(klimek): Split up into two different docker images.
-FROM nvidia/cuda:10.0-cudnn7-devel-ubuntu16.04
+#FROM nvidia/cuda:10.0-cudnn7-devel-ubuntu16.04
+FROM cudnntest:latest
 COPY --from=devtoolset /dt7 /dt7
 COPY --from=devtoolset /dt8 /dt8
 
@@ -64,5 +65,10 @@ RUN /install/install_pip_packages.sh
 
 # TODO(klimek): Figure out a better way to get the right include paths
 # forwarded when we install new packages.
+RUN ln -s "/usr/include/x86_64-linux-gnu/python2.7" "/dt7/usr/include/x86_64-linux-gnu/python2.7"
+RUN ln -s "/usr/include/x86_64-linux-gnu/python2.7" "/dt8/usr/include/x86_64-linux-gnu/python2.7"
+
 RUN ln -s "/usr/include/x86_64-linux-gnu/python3.6m" "/dt7/usr/include/x86_64-linux-gnu/python3.6m"
 RUN ln -s "/usr/include/x86_64-linux-gnu/python3.6m" "/dt8/usr/include/x86_64-linux-gnu/python3.6m"
+
+RUN /install/install_auditwheel.sh
