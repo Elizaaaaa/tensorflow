@@ -26,6 +26,7 @@ load(
 load(
     "//tensorflow:tensorflow.bzl",
     "tf_copts",
+    "tf_cc_test",
 )
 
 package(
@@ -118,6 +119,60 @@ cc_library(
         ":abi",
         ":platform",
         "//tensorflow/core/platform/default/build_config:stacktrace",
+    ],
+)
+
+cc_library(
+    name = "retrying_utils",
+    srcs = [
+        "retrying_utils.cc",
+    ],
+    hdrs = [
+        "retrying_utils.h",
+    ],
+    copts = tf_copts(),
+    deps = [
+        "//tensorflow/core:framework_headers_lib",
+        "//tensorflow/core:lib_internal",
+    ],
+)
+
+cc_library(
+    name = "retrying_file_system",
+    hdrs = [
+        "retrying_file_system.h",
+    ],
+    copts = tf_copts(),
+    deps = [
+        ":retrying_utils",
+        "//tensorflow/core:framework_headers_lib",
+        "//tensorflow/core:lib_internal",
+    ],
+)
+
+tf_cc_test(
+    name = "retrying_file_system_test",
+    size = "small",
+    srcs = ["retrying_file_system_test.cc"],
+    deps = [
+        ":retrying_file_system",
+        "//tensorflow/core:lib",
+        "//tensorflow/core:lib_internal",
+        "//tensorflow/core:test",
+        "//tensorflow/core:test_main",
+    ],
+)
+
+tf_cc_test(
+    name = "retrying_utils_test",
+    size = "small",
+    srcs = ["retrying_utils_test.cc"],
+    deps = [
+        "//tensorflow/core:retrying_utils",
+        "//tensorflow/core:lib",
+        "//tensorflow/core:lib_internal",
+        "//tensorflow/core:test",
+        "//tensorflow/core:test_main",
     ],
 )
 
@@ -243,6 +298,7 @@ filegroup(
             "cpu_info.cc",
             "platform_strings.cc",
             "protobuf.cc",
+            "retrying_utils.cc"
         ],
     ),
     visibility = ["//tensorflow/core:__pkg__"],
