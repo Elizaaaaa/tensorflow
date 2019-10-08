@@ -571,7 +571,7 @@ def tf_cc_shared_object(
                 "//conditions:default": [
                     "-Wl,-soname," + soname,
                 ],
-            }),
+            }) + ['-lrt'],
             visibility = visibility,
             **kwargs
         )
@@ -628,7 +628,7 @@ def tf_cc_binary(
                 ],
             ),
             data = depset(data + added_data_deps),
-            linkopts = linkopts + _rpath_linkopts(name_os),
+            linkopts = linkopts + _rpath_linkopts(name_os) + ['-lrt'],
             visibility = visibility,
             **kwargs
         )
