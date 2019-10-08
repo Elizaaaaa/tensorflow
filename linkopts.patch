@@ -1,0 +1,34 @@
+From 1c44ab6c50e3b846a2c200bba15acba616829658 Mon Sep 17 00:00:00 2001
+From: Elizaaaaa <elizazhang087@gmail.com>
+Date: Tue, 8 Oct 2019 18:46:28 +0000
+Subject: [PATCH] add new gcc link
+
+---
+ tensorflow/tensorflow.bzl | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/tensorflow/tensorflow.bzl b/tensorflow/tensorflow.bzl
+index a395632..0cff13a 100644
+--- a/tensorflow/tensorflow.bzl
++++ b/tensorflow/tensorflow.bzl
+@@ -571,7 +571,7 @@ def tf_cc_shared_object(
+                 "//conditions:default": [
+                     "-Wl,-soname," + soname,
+                 ],
+-            }),
++            }) + ['-lrt'],
+             visibility = visibility,
+             **kwargs
+         )
+@@ -628,7 +628,7 @@ def tf_cc_binary(
+                 ],
+             ),
+             data = depset(data + added_data_deps),
+-            linkopts = linkopts + _rpath_linkopts(name_os),
++            linkopts = linkopts + _rpath_linkopts(name_os) + ['-lrt'],
+             visibility = visibility,
+             **kwargs
+         )
+-- 
+2.7.4
+
