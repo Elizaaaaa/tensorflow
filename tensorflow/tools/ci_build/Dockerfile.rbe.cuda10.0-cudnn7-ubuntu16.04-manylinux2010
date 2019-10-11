@@ -10,6 +10,11 @@
 
 FROM cudnntest:latest as devtoolset
 
+# In the Ubuntu 16.04 images, cudnn is placed in system paths. Move them to
+# /usr/local/cuda
+RUN cp -P /usr/include/cudnn.h /usr/local/cuda/include
+RUN cp -P /usr/lib/x86_64-linux-gnu/libcudnn* /usr/local/cuda/lib64
+
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
       cpio \
@@ -52,6 +57,7 @@ RUN /install/install_bootstrap_deb_packages.sh
 RUN /install/install_deb_packages.sh
 RUN /install/install_clang.sh
 RUN /install/install_bazel.sh
+RUN chmod 744 /install/install_gcc7.sh
 RUN /install/install_gcc7.sh
 
 # Install python 3.6.
