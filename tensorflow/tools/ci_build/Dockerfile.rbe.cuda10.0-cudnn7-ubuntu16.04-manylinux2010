@@ -8,12 +8,7 @@
 #  --tag "gcr.io/tensorflow-testing/nosla-cuda10.0-cudnn7-ubuntu16.04-manylinux2010" .
 # $ docker push gcr.io/tensorflow-testing/nosla-cuda10.0-cudnn7-ubuntu16.04-manylinux2010
 
-FROM cudnntest:latest as devtoolset
-
-# In the Ubuntu 16.04 images, cudnn is placed in system paths. Move them to
-# /usr/local/cuda
-RUN cp -P /usr/include/cudnn.h /usr/local/cuda/include
-RUN cp -P /usr/lib/x86_64-linux-gnu/libcudnn* /usr/local/cuda/lib64
+FROM cudnn:latest as devtoolset
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
@@ -39,7 +34,7 @@ RUN /build_devtoolset.sh devtoolset-8 /dt8
 
 # TODO(klimek): Split up into two different docker images.
 #FROM nvidia/cuda:10.0-cudnn7-devel-ubuntu16.04
-FROM cudnntest:latest
+FROM cudnn:latest
 COPY --from=devtoolset /dt7 /dt7
 COPY --from=devtoolset /dt8 /dt8
 
