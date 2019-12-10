@@ -67,6 +67,7 @@ RUN wget https://www.python.org/ftp/python/3.6.8/Python-3.6.8.tar.xz && \
     update-alternatives --install /usr/bin/easy_install3 easy_install3 /usr/local/bin/easy_install-3.6 0
 
 RUN /install/install_pip_packages.sh
+RUN /install/install_auditwheel.sh
 
 # TODO(klimek): Figure out a better way to get the right include paths
 # forwarded when we install new packages.
