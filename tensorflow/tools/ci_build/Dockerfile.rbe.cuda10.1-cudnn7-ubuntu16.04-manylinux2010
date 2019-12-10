@@ -10,6 +10,11 @@
 
 FROM nvidia/cuda:10.1-cudnn7-devel-ubuntu16.04 as devtoolset
 
+# In the Ubuntu 16.04 images, cudnn is placed in system paths. Move them to
+# /usr/local/cuda
+RUN cp -P /usr/include/cudnn.h /usr/local/cuda/include
+RUN cp -P /usr/lib/x86_64-linux-gnu/libcudnn* /usr/local/cuda/lib64
+
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
       cpio \
